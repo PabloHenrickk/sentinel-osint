@@ -1,0 +1,2 @@
+OUTPUT_DIR = "data"
+LOG_LEVEL = "INFO"
