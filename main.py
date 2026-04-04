@@ -1,20 +1,43 @@
 from agents.collector import run as collect
 from agents.validator import run as validate
 from agents.reporter import run as report
+from agents.correlator import run as correlate
 
 if __name__ == "__main__":
-    domain = input("Digite o domínio para investigar: ")
+    print("=== Sentinel OSINT ===\n")
 
-    # etapa 1 — coleta
-    dados = collect(domain)
+    # coleta múltiplos domínios
+    entrada = input("Digite domínios separados por vírgula: ")
+    dominios = [d.strip() for d in entrada.split(",")]
 
-    # etapa 2 — validação
-    validacao = validate(dados)
+    aprovados = []
 
-    # etapa 3 — relatório (só gera se aprovado)
-    if validacao["approved"]:
-        caminhos = report(dados, validacao)
-        print(f"\n✅ Relatório gerado: {caminhos['markdown']}")
+    for domain in dominios:
+        print(f"\n--- Processando: {domain} ---")
+
+        # coleta
+        dados = collect(domain)
+
+        # valida
+        validacao = validate(dados)
+
+        # só aprova se passou na validação
+        if validacao["approved"]:
+            aprovados.append(dados)
+            report(dados, validacao)
+        else:
+            print(f"❌ {domain} reprovado — score {validacao['confidence_score']}/100")
+
+    # correlaciona se tiver mais de um aprovado
+    print(f"\n--- Correlação ---")
+    if len(aprovados) >= 2:
+        resultado = correlate(aprovados)
+        print(f"\nPares analisados: {resultado['total_pairs']}")
+        if resultado["high_correlations"]:
+            print("🔴 Correlações fortes encontradas:")
+            for c in resultado["high_correlations"]:
+                print(f"  {c['pair']} — score {c['correlation_score']}/100")
+                if c["shared_ips"]:
+                    print(f"  IPs compartilhados: {c['shared_ips']}")
     else:
-        print(f"\n❌ Domínio reprovado na validação. Score: {validacao['confidence_score']}/100")
-        print("Relatório não gerado.")
+        print("Mínimo 2 domínios aprovados necessários para correlação.")
