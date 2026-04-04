@@ -1,5 +1,6 @@
 from agents.collector import run as collect
 from agents.validator import run as validate
+from agents.reporter import run as report
 
 if __name__ == "__main__":
     domain = input("Digite o domínio para investigar: ")
@@ -10,7 +11,10 @@ if __name__ == "__main__":
     # etapa 2 — validação
     validacao = validate(dados)
 
-    print("\n--- VALIDAÇÃO ---")
-    print(f"Confiança: {validacao['confidence_score']}/100")
-    print(f"Status: {'✅ Aprovado' if validacao['approved'] else '❌ Reprovado'}")
-    print(f"Checks: {validacao['checks']}")
+    # etapa 3 — relatório (só gera se aprovado)
+    if validacao["approved"]:
+        caminhos = report(dados, validacao)
+        print(f"\n✅ Relatório gerado: {caminhos['markdown']}")
+    else:
+        print(f"\n❌ Domínio reprovado na validação. Score: {validacao['confidence_score']}/100")
+        print("Relatório não gerado.")

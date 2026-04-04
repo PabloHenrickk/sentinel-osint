@@ -12,10 +12,19 @@ from core.config import OUTPUT_DIR
 def collect_whois(domain: str) -> dict:
     try:
         data = whois.whois(domain)
+
+        # WHOIS pode retornar lista ou valor único — normaliza pra string limpa
+        def parse_date(value):
+            if isinstance(value, list):
+                value = value[0]
+            if hasattr(value, 'strftime'):
+                return value.strftime("%Y-%m-%d")
+            return str(value)
+
         return {
             "registrar": data.registrar,
-            "creation_date": str(data.creation_date),
-            "expiration_date": str(data.expiration_date),
+            "creation_date": parse_date(data.creation_date),
+            "expiration_date": parse_date(data.expiration_date),
             "name_servers": data.name_servers,
         }
     except Exception as e:
