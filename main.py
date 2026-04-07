@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from agents.ai_analyst import run as analyze
 
 from agents.collector    import run as collect
 from agents.validator    import run as validate
@@ -11,7 +12,7 @@ from agents.shodan_agent import run as shodan_scan
 
 
 # ── CORES ANSI ──────────────────────────────────────────────
-CY  = "\033[96m"   # cyan
+CY  = "\033[96m"   # cyana
 GR  = "\033[92m"   # verde
 RD  = "\033[91m"   # vermelho
 YL  = "\033[93m"   # amarelo
@@ -148,6 +149,7 @@ def run_pipeline(targets: list[str]) -> list[dict]:
         aprovados.append(dados)
 
         # shodan
+        shodan_result = None
         ips = dados.get("dns", {}).get("A", [])
         if ips:
             print()
@@ -159,8 +161,38 @@ def run_pipeline(targets: list[str]) -> list[dict]:
         else:
             status_warn("Nenhum IP resolvido — Shodan ignorado")
 
-    return aprovados
+        # análise de IA
+        print()
+        status_info("Executando análise de inteligência...")
+        ai_result = analyze(
+            collected_data=dados,
+            validation=validacao,
+            shodan_data=shodan_result if ips else None,
+        )
 
+        priority = ai_result.get("priority_level", "?")
+        findings = ai_result.get("findings", [])
+        summ     = ai_result.get("executive_summary", "")
+
+        print()
+        label("Prioridade :", priority,
+              color=RD if priority == "CRÍTICO" else
+                    YL if priority == "ALTO" else
+                    GR if priority == "BAIXO" else CY)
+        label("Achados    :", str(len(findings)))
+
+        if summ:
+            print(f"\n  {DM}{summ[:200]}{RS}")
+
+        if findings:
+            print()
+            status_warn("Principais achados:")
+            for f in findings[:3]:
+                sev   = f.get("severity", "?")
+                title = f.get("title", "?")
+                print(f"    {RD if sev == 'CRÍTICO' else YL}● [{sev}]{RS} {title}")
+
+    return aprovados
 
 def run_correlation(aprovados: list[dict]):
     """
