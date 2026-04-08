@@ -330,4 +330,4 @@ if __name__ == "__main__":
     clear_session(targets)
 
     line(color=CY)
-    print(f"\n  {DM}Sentinel OSINT — uso ético e responsável{RS}\n")
+    print(f"\n  {DM}Sentinel OSINT — uso ético e responsável!{RS}\n")
