@@ -335,7 +335,6 @@ def run_pipeline(targets: list[str]) -> list[dict]:
 
 
 def run_correlation(aprovados: list[dict]):
-    """Correlação final com todos os alvos aprovados."""
     if len(aprovados) < 2:
         return
 
@@ -344,8 +343,8 @@ def run_correlation(aprovados: list[dict]):
     header_section("CORRELAÇÃO FINAL ENTRE ALVOS")
     status_info(f"Analisando {len(aprovados)} alvo(s)...")
 
-    resultado = correlate(aprovados)
-    high      = resultado.get("high_correlations", [])
+    resultado = correlate(aprovados)          # list[dict]
+    high      = [c for c in resultado if c.get("correlation_score", 0) >= 50]
 
     if high:
         print()
@@ -357,7 +356,7 @@ def run_correlation(aprovados: list[dict]):
             if c.get("shared_ips"):
                 print(f"      {DM}IPs: {c['shared_ips']}{RS}")
             if c.get("shared_nameservers"):
-                print(f"      {DM}NS: {c['shared_nameservers']}{RS}")
+                print(f"        {DM}NS: {c['shared_nameservers']}{RS}")
             if c.get("same_registrar"):
                 print(f"      {DM}Registrar: {c['registrar']}{RS}")
     else:

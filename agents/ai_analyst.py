@@ -5,6 +5,8 @@ Recebe dados dos agentes anteriores, injeta Skills + memória persistente
 e retorna análise estruturada via LLM com validação Pydantic.
 
 Pipeline: collector → validator → shodan_agent → correlator → [ai_analyst]
+
+Providers suportados: groq | openrouter | ollama
 """
 
 import json
@@ -42,29 +44,27 @@ MEMORY_FILES = {
     "corrections": MEMORY_DIR / "error_corrections.json",
 }
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
 
 # ── schemas Pydantic ─────────────────────────────────────────
 
 class Finding(BaseModel):
     """Representa um achado individual da análise."""
-    title      : str            = Field(..., description="Título curto do achado")
-    severity   : str            = Field(..., description="CRÍTICO | ALTO | MÉDIO | BAIXO | INFO")
-    description: str            = Field(..., description="Descrição técnica do achado")
-    mitre_id   : Optional[str]  = Field(None, description="ID da técnica MITRE ATT&CK")
-    mitre_name : Optional[str]  = Field(None, description="Nome da técnica MITRE ATT&CK")
-    evidence   : Optional[str]  = Field(None, description="Evidência que suporta o achado")
+    title      : str           = Field(..., description="Título curto do achado")
+    severity   : str           = Field(..., description="CRÍTICO | ALTO | MÉDIO | BAIXO | INFO")
+    description: str           = Field(..., description="Descrição técnica do achado")
+    mitre_id   : Optional[str] = Field(None, description="ID da técnica MITRE ATT&CK")
+    mitre_name : Optional[str] = Field(None, description="Nome da técnica MITRE ATT&CK")
+    evidence   : Optional[str] = Field(None, description="Evidência que suporta o achado")
 
 
 class AnalysisOutput(BaseModel):
     """Schema obrigatório de saída do ai_analyst."""
-    priority_level   : str          = Field(..., description="CRÍTICO | ALTO | MÉDIO | BAIXO | INFO")
-    executive_summary: str          = Field(..., description="Resumo executivo em 2-3 frases")
-    findings         : list[Finding] = Field(default_factory=list)
-    threat_hypotheses: list[str]    = Field(default_factory=list, description="Hipóteses adversariais")
-    recommendations  : list[str]    = Field(default_factory=list, description="Ações recomendadas")
-    confidence_score : Optional[int] = Field(None, ge=0, le=100, description="Confiança 0-100")
+    priority_level   : str             = Field(..., description="CRÍTICO | ALTO | MÉDIO | BAIXO | INFO")
+    executive_summary: str             = Field(..., description="Resumo executivo em 2-3 frases")
+    findings         : list[Finding]   = Field(default_factory=list)
+    threat_hypotheses: list[str]       = Field(default_factory=list)
+    recommendations  : list[str]       = Field(default_factory=list)
+    confidence_score : Optional[int]   = Field(None, ge=0, le=100)
 
 
 def _error_output(reason: str, raw: str = "") -> dict:
@@ -99,7 +99,6 @@ def load_skills() -> str:
 # ── carregamento de memória ──────────────────────────────────
 
 def _load_json_file(path: Path, root_key: str) -> list:
-    """Carrega lista de um arquivo JSON com chave raiz definida."""
     if not path.exists():
         return []
     try:
@@ -111,7 +110,6 @@ def _load_json_file(path: Path, root_key: str) -> list:
 
 
 def load_memory() -> dict:
-    """Carrega patterns e corrections da memória persistente."""
     memory = {
         "patterns"   : _load_json_file(MEMORY_FILES["patterns"],    "patterns"),
         "corrections": _load_json_file(MEMORY_FILES["corrections"],  "corrections"),
@@ -124,7 +122,6 @@ def load_memory() -> dict:
 
 
 def format_memory(memory: dict) -> str:
-    """Formata memória como texto para injeção no system prompt."""
     lines: list[str] = []
     if memory["corrections"]:
         lines.append("## CORREÇÕES APRENDIDAS (aplicar sempre)")
@@ -140,15 +137,10 @@ def format_memory(memory: dict) -> str:
 # ── salvar na memória ────────────────────────────────────────
 
 def _ensure_memory_file(path: Path, root_key: str) -> dict:
-    """
-    Garante que o arquivo de memória existe e é válido.
-    Cria com estrutura vazia se não existir.
-    """
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         initial = {root_key: []}
         path.write_text(json.dumps(initial, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.info(f"[ai_analyst] Arquivo de memória criado: {path.name}")
         return initial
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -160,10 +152,6 @@ def _ensure_memory_file(path: Path, root_key: str) -> dict:
 
 
 def save_correction(rule: str, context: str = "") -> bool:
-    """
-    Salva correção na memória persistente.
-    Retorna True em sucesso, False em falha — nunca levanta exceção.
-    """
     try:
         path = MEMORY_FILES["corrections"]
         data = _ensure_memory_file(path, "corrections")
@@ -181,10 +169,6 @@ def save_correction(rule: str, context: str = "") -> bool:
 
 
 def save_pattern(pattern: str, source: str = "") -> bool:
-    """
-    Salva padrão identificado na memória persistente.
-    Retorna True em sucesso, False em falha — nunca levanta exceção.
-    """
     try:
         path = MEMORY_FILES["patterns"]
         data = _ensure_memory_file(path, "patterns")
@@ -204,7 +188,6 @@ def save_pattern(pattern: str, source: str = "") -> bool:
 # ── montar system prompt ─────────────────────────────────────
 
 def build_system_prompt(skills: str, memory: str) -> str:
-    """Monta system prompt com Skills e memória ativa."""
     parts = [
         "Você é um motor analítico de Threat Intelligence.",
         "Transforma dados brutos em inteligência acionável.",
@@ -218,13 +201,46 @@ def build_system_prompt(skills: str, memory: str) -> str:
     return "\n".join(parts)
 
 
-# ── chamada OpenRouter ───────────────────────────────────────
+# ── providers de IA ──────────────────────────────────────────
+
+def call_groq(system_prompt: str, data_context: str, model: str) -> str:
+    """
+    Chama modelo via Groq API (compatível com OpenAI).
+    Groq é o provider principal — mais rápido e gratuito no tier atual.
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY não encontrada no .env")
+
+    logger.info(f"[ai_analyst] Groq → modelo: {model}")
+
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type" : "application/json",
+        },
+        json={
+            "model"      : model,
+            "temperature": 0.1,
+            "messages"   : [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": data_context},
+            ],
+        },
+        timeout=120,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Groq retornou {response.status_code}: {response.text[:300]}"
+        )
+
+    return response.json()["choices"][0]["message"]["content"]
+
 
 def call_openrouter(system_prompt: str, data_context: str, model: str) -> str:
-    """
-    Chama modelo via OpenRouter (interface compatível com OpenAI).
-    Levanta RuntimeError em qualquer falha — tratado pelo roteador.
-    """
+    """Chama modelo via OpenRouter."""
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         raise ValueError("OPENROUTER_API_KEY não encontrada no .env")
@@ -232,7 +248,7 @@ def call_openrouter(system_prompt: str, data_context: str, model: str) -> str:
     logger.info(f"[ai_analyst] OpenRouter → modelo: {model}")
 
     response = requests.post(
-        OPENROUTER_URL,
+        "https://openrouter.ai/api/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type" : "application/json",
@@ -258,21 +274,13 @@ def call_openrouter(system_prompt: str, data_context: str, model: str) -> str:
     return response.json()["choices"][0]["message"]["content"]
 
 
-# ── chamada Ollama (fallback local) ─────────────────────────
-
 def call_ollama(system_prompt: str, data_context: str, model: str) -> str:
-    """
-    Fallback local via Ollama.
-    Import lazy — não quebra o startup se Ollama não estiver instalado.
-    """
+    """Fallback local via Ollama. Import lazy — não quebra startup."""
     logger.info(f"[ai_analyst] Ollama → modelo: {model}")
     try:
         import ollama as ollama_client
     except ImportError:
-        raise RuntimeError(
-            "Pacote 'ollama' não instalado. "
-            "Execute: pip install ollama"
-        )
+        raise RuntimeError("Pacote 'ollama' não instalado. Execute: pip install ollama")
 
     response = ollama_client.chat(
         model=model,
@@ -285,26 +293,34 @@ def call_ollama(system_prompt: str, data_context: str, model: str) -> str:
     return response["message"]["content"]
 
 
-# ── roteador de providers ────────────────────────────────────
-
 def call_model(system_prompt: str, data_context: str) -> str:
     """
-    Roteia chamada para o provider correto lido do .env.
+    Roteia chamada para o provider configurado no .env.
 
-    Hierarquia:
-      1. Provider configurado em AI_PROVIDER
-      2. Ollama local como fallback automático (se provider principal falhar)
+    Hierarquia de fallback:
+      groq       → falha → ollama
+      openrouter → falha → ollama
+      ollama     → sem fallback
+
+    Providers válidos: groq | openrouter | ollama
     """
-    provider = os.getenv("AI_PROVIDER", "openrouter").lower().strip()
-    model    = os.getenv("AI_MODEL", "qwen/qwen3-8b:free").strip()
+    provider = os.getenv("AI_PROVIDER", "groq").lower().strip()
+    model    = os.getenv("AI_MODEL", "llama-3.3-70b-versatile").strip()
+    fallback = os.getenv("OLLAMA_FALLBACK_MODEL", "llama3.1:8b").strip()
 
     logger.info(f"[ai_analyst] Provider: {provider} | Modelo: {model}")
 
-    if provider == "openrouter":
+    if provider == "groq":
+        try:
+            return call_groq(system_prompt, data_context, model)
+        except Exception as e:
+            logger.warning(f"[ai_analyst] Groq falhou ({e}). Fallback → Ollama/{fallback}")
+            return call_ollama(system_prompt, data_context, fallback)
+
+    elif provider == "openrouter":
         try:
             return call_openrouter(system_prompt, data_context, model)
         except Exception as e:
-            fallback = os.getenv("OLLAMA_FALLBACK_MODEL", "llama3.1:8b").strip()
             logger.warning(f"[ai_analyst] OpenRouter falhou ({e}). Fallback → Ollama/{fallback}")
             return call_ollama(system_prompt, data_context, fallback)
 
@@ -313,7 +329,7 @@ def call_model(system_prompt: str, data_context: str) -> str:
 
     else:
         raise ValueError(
-            f"AI_PROVIDER inválido: '{provider}'. Use 'openrouter' ou 'ollama'."
+            f"AI_PROVIDER inválido: '{provider}'. Use 'groq', 'openrouter' ou 'ollama'."
         )
 
 
@@ -322,7 +338,6 @@ def call_model(system_prompt: str, data_context: str) -> str:
 def parse_response(raw: str) -> dict:
     """
     Extrai JSON da resposta do LLM com múltiplas estratégias de fallback.
-    Valida via Pydantic — retorna estrutura de erro se tudo falhar.
 
     Estratégias (ordem):
       1. Parse direto do texto limpo
@@ -332,32 +347,25 @@ def parse_response(raw: str) -> dict:
     """
     cleaned = raw.strip()
 
-    # estratégia 1 — parse direto
     try:
-        data = json.loads(cleaned)
-        return _validate_output(data, raw)
+        return _validate_output(json.loads(cleaned), raw)
     except json.JSONDecodeError:
         pass
 
-    # estratégia 2 — bloco markdown
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
     if match:
         try:
-            data = json.loads(match.group(1).strip())
-            return _validate_output(data, raw)
+            return _validate_output(json.loads(match.group(1).strip()), raw)
         except json.JSONDecodeError:
             pass
 
-    # estratégia 3 — regex para objeto JSON
     match = re.search(r"\{[\s\S]*\}", cleaned)
     if match:
         try:
-            data = json.loads(match.group())
-            return _validate_output(data, raw)
+            return _validate_output(json.loads(match.group()), raw)
         except json.JSONDecodeError:
             pass
 
-    # estratégia 4 — falha total
     logger.error(f"[ai_analyst] Todas as estratégias de parse falharam. Raw:\n{raw[:400]}")
     return _error_output("Modelo retornou formato inválido — JSON não encontrado", raw)
 
@@ -365,18 +373,15 @@ def parse_response(raw: str) -> dict:
 def _validate_output(data: dict, raw: str) -> dict:
     """
     Valida dict contra AnalysisOutput via Pydantic.
-    Em falha de validação: loga campos ausentes e retorna o dict parcial
-    com campos obrigatórios preenchidos — pipeline não trava.
+    Em falha parcial: preenche campos obrigatórios e registra warnings.
     """
     try:
-        validated = AnalysisOutput(**data)
-        return validated.model_dump()
+        return AnalysisOutput(**data).model_dump()
     except ValidationError as e:
         logger.warning(
             f"[ai_analyst] Validação Pydantic falhou — {e.error_count()} erro(s). "
             f"Usando dados parciais."
         )
-        # preenche campos obrigatórios ausentes sem descartar o restante
         data.setdefault("priority_level",    "INDETERMINADO")
         data.setdefault("executive_summary", "Resumo não gerado pelo modelo.")
         data.setdefault("findings",          [])
@@ -389,10 +394,11 @@ def _validate_output(data: dict, raw: str) -> dict:
 # ── salvar análise ───────────────────────────────────────────
 
 def save_analysis(target: str, analysis: dict) -> str:
-    """Persiste análise em JSON no diretório data/."""
     OUTPUT_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename  = OUTPUT_DIR / f"{target}_{timestamp}_ai_analysis.json"
+    # sanitiza target para nome de arquivo seguro
+    safe_name = target.replace(".", "_").replace("/", "-").replace(":", "-")
+    filename  = OUTPUT_DIR / f"{safe_name}_{timestamp}_ai_analysis.json"
     filename.write_text(
         json.dumps(analysis, indent=2, ensure_ascii=False),
         encoding="utf-8"
@@ -412,26 +418,29 @@ def run(
     """
     Função principal do AI Analyst.
 
-    Parâmetros:
+    Args:
         collected_data  → output do collector  (WHOIS, DNS)         [obrigatório]
         validation      → output do validator  (score, checks)      [opcional]
-        shodan_data     → output do shodan_agent (portas, serviços) [opcional]
+        shodan_data     → output do infra_agent (portas, serviços)  [opcional]
         correlator_data → output do correlator  (pares, scores)     [opcional]
 
-    Retorna:
+    Returns:
         dict com análise estruturada — nunca levanta exceção.
     """
-    target = collected_data.get("domain",
-             collected_data.get("ip", "desconhecido"))
+    # resolve target corretamente para IP e domínio
+    # is_ip garante que nunca lemos domain=None para IPs
+    is_ip  = collected_data.get("is_ip", False)
+    target = collected_data.get("ip") if is_ip else collected_data.get("domain", "desconhecido")
+    if not target:
+        target = "desconhecido"
+
     logger.info(f"[ai_analyst] Iniciando análise para: {target}")
 
-    # carrega skills e memória
     skills        = load_skills()
     memory        = load_memory()
     mem_str       = format_memory(memory)
     system_prompt = build_system_prompt(skills, mem_str)
 
-    # monta contexto de dados
     context_parts = [
         f"ALVO: {target}",
         "",
@@ -449,7 +458,7 @@ def run(
     if shodan_data and "error" not in shodan_data:
         context_parts += [
             "",
-            "## DADOS SHODAN (infraestrutura exposta)",
+            "## DADOS DE INFRAESTRUTURA (portas, serviços)",
             json.dumps(shodan_data, indent=2, ensure_ascii=False),
         ]
 
@@ -466,7 +475,6 @@ def run(
 
     data_context = "\n".join(context_parts)
 
-    # chama o modelo — nunca propaga exceção para fora
     try:
         raw_response = call_model(system_prompt, data_context)
     except Exception as e:
@@ -474,17 +482,16 @@ def run(
         analysis = _error_output(f"Todos os providers falharam: {e}")
         analysis["target"]      = target
         analysis["analyzed_at"] = datetime.now().isoformat()
-        analysis["provider"]    = os.getenv("AI_PROVIDER", "openrouter")
-        analysis["model"]       = os.getenv("AI_MODEL", "qwen/qwen3-8b:free")
+        analysis["provider"]    = os.getenv("AI_PROVIDER", "groq")
+        analysis["model"]       = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
         analysis["saved_to"]    = save_analysis(target, analysis)
         return analysis
 
-    # parseia e valida resposta
     analysis = parse_response(raw_response)
     analysis["target"]      = target
     analysis["analyzed_at"] = datetime.now().isoformat()
-    analysis["provider"]    = os.getenv("AI_PROVIDER", "openrouter")
-    analysis["model"]       = os.getenv("AI_MODEL", "qwen/qwen3-8b:free")
+    analysis["provider"]    = os.getenv("AI_PROVIDER", "groq")
+    analysis["model"]       = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
     analysis["saved_to"]    = save_analysis(target, analysis)
 
     logger.info(
