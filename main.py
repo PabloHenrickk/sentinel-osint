@@ -5,13 +5,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from agents.ai_analyst   import run as analyze
-from agents.collector    import run as collect
-from agents.validator    import run as validate
-from agents.reporter     import run as report
-from agents.correlator   import run as correlate
-from agents.shodan_agent import run as shodan_scan
-
 # ── CORES ANSI ──────────────────────────────────────────────
 CY  = "\033[96m"
 GR  = "\033[92m"
@@ -22,6 +15,36 @@ BLD = "\033[1m"
 RS  = "\033[0m"
 
 SESSION_DIR = Path("data/sessions")
+
+
+# ── IMPORTS LAZY — carrega agente só quando for usar ─────────
+# Motivo: se um agente tiver erro de sintaxe ou dependência
+# faltando, o sistema não cai inteiro antes do banner.
+# O erro aparece no momento exato em que o agente é chamado,
+# com contexto claro de qual alvo estava sendo processado.
+
+def _load_agent(name: str):
+    """
+    Importa um agente pelo nome e retorna sua função run().
+    Em caso de erro, retorna uma função que reporta a falha
+    sem travar o pipeline.
+    """
+    try:
+        import importlib
+        module = importlib.import_module(f"agents.{name}")
+        return module.run
+    except ImportError as e:
+        # dependência faltando (ex: pacote não instalado)
+        def _agent_unavailable(*args, **kwargs):
+            return {"error": f"Agente '{name}' indisponível: {e}"}
+        print(f"  {YL}⚠{RS}  Agente '{name}' não carregado: {e}")
+        return _agent_unavailable
+    except SyntaxError as e:
+        # erro de sintaxe no código do agente
+        def _agent_broken(*args, **kwargs):
+            return {"error": f"Agente '{name}' com erro de sintaxe: {e}"}
+        print(f"  {RD}✖{RS}  Agente '{name}' com erro de sintaxe: {e}")
+        return _agent_broken
 
 
 # ── CHECKPOINT ──────────────────────────────────────────────
@@ -122,20 +145,36 @@ def input_targets() -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
-def print_shodan_result(result: dict):
-    if "error" in result:
-        status_warn(f"Shodan: {result['error']}")
+def print_infra_result(result: dict):
+    """Exibe resultado do infra_agent (substitui print_shodan_result)."""
+    if "error" in result and not result.get("open_ports"):
+        status_warn(f"Infra: {result['error']}")
+        # se houve fallback parcial, mostra qual provider foi usado
+        if result.get("provider_errors"):
+            for err in result["provider_errors"]:
+                print(f"      {DM}✖ {err}{RS}")
         return
+
+    provider = result.get("provider_used", "desconhecido")
+    cdn      = result.get("cdn_detected")
+
     print()
-    label("Organização",   result.get("organization", "—"))
-    label("País / Cidade", f"{result.get('country','—')} / {result.get('city','—')}")
-    label("Sistema Op.",   result.get("os") or "—")
-    label("Portas abertas", str(result.get("open_ports", [])))
+    label("Provider usado",  provider,                          color=DM)
+    label("Organização",     result.get("organization", "—"))
+    label("País / Cidade",   f"{result.get('country','—')} / {result.get('city','—')}")
+    label("ASN",             result.get("asn") or "—",          color=DM)
+    label("Sistema Op.",     result.get("os") or "—",           color=DM)
+    label("Portas abertas",  str(result.get("open_ports", [])))
+
+    if cdn:
+        status_warn(f"CDN detectada: {cdn} — dados refletem a CDN, não o servidor de origem")
+
     vulns = result.get("vulns", [])
     label("CVEs", ", ".join(vulns) if vulns else "Nenhum indexado",
           color=RD if vulns else DM)
+
     services = result.get("services", [])
-    critical = [s for s in services if s["severity"] == "CRÍTICO"]
+    critical = [s for s in services if s.get("severity") == "CRÍTICO"]
     if critical:
         print()
         status_warn(f"{len(critical)} serviço(s) CRÍTICO(s):")
@@ -156,22 +195,31 @@ def process_single_target(
 ) -> dict | None:
     """
     Executa o pipeline completo em um único alvo.
-
-    Retorna dict com dados aprovados, ou None se reprovado.
-    Recebe correlator_snapshot dos alvos JÁ processados — 
-    permite que o ai_analyst considere correlações parciais.
+    Carrega cada agente com lazy import — falha de um não derruba os outros.
     """
     header_section(f"ALVO {idx}/{total} — {target.upper()}")
+
+    # carrega agentes com lazy import
+    collect    = _load_agent("collector")
+    validate   = _load_agent("validator")
+    report     = _load_agent("reporter")
+    infra_scan = _load_agent("infra_agent")
+    analyze    = _load_agent("ai_analyst")
 
     # coleta
     status_info("Coletando WHOIS e DNS...")
     dados = collect(target)
 
+    # para se a coleta falhar completamente
+    if "error" in dados and not dados.get("domain") and not dados.get("ip"):
+        status_err(f"Coleta falhou: {dados['error']}")
+        return None
+
     # validação
     validacao = validate(dados)
-    score     = validacao["confidence_score"]
+    score     = validacao.get("confidence_score", 0)
 
-    if not validacao["approved"]:
+    if not validacao.get("approved"):
         status_err(f"Reprovado — score {score}/100")
         return None
 
@@ -179,30 +227,41 @@ def process_single_target(
 
     # relatório base
     status_info("Gerando relatório base...")
-    caminhos = report(dados, validacao)
-    status_ok(f"Relatório → {caminhos['markdown']}")
+    try:
+        caminhos = report(dados, validacao)
+        status_ok(f"Relatório → {caminhos.get('markdown', 'gerado')}")
+    except Exception as e:
+        status_warn(f"Relatório base falhou (não crítico): {e}")
 
-    # shodan
-    shodan_result = None
-    ips = dados.get("dns", {}).get("A", [])
+    # reconhecimento de infraestrutura
+    # para domínio: usa IPs resolvidos pelo DNS
+    # para IP direto: usa o próprio alvo
+    infra_result = None
+    target_type  = dados.get("target_type", "domain")
+
+    if target_type == "ip":
+        ips = [target]
+    else:
+        ips = dados.get("dns", {}).get("A", [])
+
     if ips:
         print()
-        status_info(f"Reconhecimento Shodan em {len(ips)} IP(s)...")
+        status_info(f"Reconhecimento de infraestrutura em {len(ips)} IP(s)...")
         for ip in ips:
             status_info(f"Escaneando {ip}")
-            shodan_result = shodan_scan(ip)
-            print_shodan_result(shodan_result)
+            infra_result = infra_scan(ip)
+            print_infra_result(infra_result)
     else:
-        status_warn("Nenhum IP resolvido — Shodan ignorado")
+        status_warn("Nenhum IP resolvido — reconhecimento de infra ignorado")
 
-    # análise de IA — agora recebe correlator_snapshot
+    # análise de IA
     print()
     status_info("Executando análise de inteligência...")
     ai_result = analyze(
         collected_data  = dados,
         validation      = validacao,
-        shodan_data     = shodan_result if ips else None,
-        correlator_data = correlator_snapshot,  # ← bug corrigido
+        shodan_data     = infra_result,       # nome mantido para compatibilidade com ai_analyst
+        correlator_data = correlator_snapshot,
     )
 
     priority = ai_result.get("priority_level", "?")
@@ -233,19 +292,18 @@ def process_single_target(
 def run_pipeline(targets: list[str]) -> list[dict]:
     """
     Executa pipeline com checkpoint por alvo.
-
-    - Retoma sessão interrompida automaticamente
-    - Correlação parcial alimenta o ai_analyst em tempo real
-    - Salva estado após cada alvo concluído
+    Retoma sessão interrompida automaticamente.
     """
-    state    = load_session(targets)
+    state     = load_session(targets)
     completed = set(state.get("completed", []))
     aprovados = state.get("aprovados", [])
     total     = len(targets)
 
+    # carrega correlator uma vez (usado em todo o loop)
+    correlate = _load_agent("correlator")
+
     for idx, target in enumerate(targets, 1):
 
-        # pula alvos já processados na sessão anterior
         if target in completed:
             status_info(f"[{idx}/{total}] {target} — já processado, pulando")
             continue
@@ -268,7 +326,6 @@ def run_pipeline(targets: list[str]) -> list[dict]:
         if resultado:
             aprovados.append(resultado)
 
-        # checkpoint — salva estado mesmo se o alvo foi reprovado
         state["completed"] = list(completed | {target})
         state["aprovados"] = aprovados
         completed.add(target)
@@ -282,11 +339,13 @@ def run_correlation(aprovados: list[dict]):
     if len(aprovados) < 2:
         return
 
+    correlate = _load_agent("correlator")
+
     header_section("CORRELAÇÃO FINAL ENTRE ALVOS")
     status_info(f"Analisando {len(aprovados)} alvo(s)...")
 
     resultado = correlate(aprovados)
-    high = resultado.get("high_correlations", [])
+    high      = resultado.get("high_correlations", [])
 
     if high:
         print()
@@ -320,14 +379,14 @@ if __name__ == "__main__":
     clear()
     banner()
 
+    # agentes carregados APÓS o banner — erro aparece com contexto visual
     targets   = input_targets()
     aprovados = run_pipeline(targets)
 
     run_correlation(aprovados)
     summary(aprovados, targets)
 
-    # limpa sessão apenas após conclusão total
     clear_session(targets)
 
     line(color=CY)
-    print(f"\n  {DM}Sentinel OSINT — uso ético e responsável!{RS}\n")
+    print(f"\n  {DM}Sentinel OSINT — uso ético e responsável{RS}\n")

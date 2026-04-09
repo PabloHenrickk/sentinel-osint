@@ -65,33 +65,36 @@ def correlate_pair(a: dict, b: dict) -> dict:
     }
 
 
-def run(collected_list: list) -> dict:
+def run(target: str) -> dict:
     """
-    Função principal do correlator.
-    Recebe lista de resultados coletados e correlaciona todos os pares.
+    Coleta WHOIS e DNS para domínio, ou apenas DNS reverso para IP.
+    Detecta automaticamente o tipo de alvo.
     """
-    domains = [c.get("domain", "?") for c in collected_list]
-    print(f"[correlator] Correlacionando {len(domains)} domínios: {domains}")
+    import re
+    is_ip = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target))
 
-    correlations = []
+    print(f"[collector] Iniciando coleta para: {target} ({'IP' if is_ip else 'domínio'})")
 
-    # combinations gera todos os pares possíveis sem repetir
-    # ex: [a, b, c] → (a,b), (a,c), (b,c)
-    for a, b in combinations(collected_list, 2):
-        result = correlate_pair(a, b)
-        correlations.append(result)
+    if is_ip:
+        # IPs não têm WHOIS de domínio — coleta só o que faz sentido
+        result = {
+            "ip"        : target,
+            "domain"    : None,
+            "target_type": "ip",
+            "timestamp" : datetime.now().isoformat(),
+            "whois"     : {"skipped": "Alvo é IP — WHOIS de domínio não aplicável"},
+            "dns"       : collect_dns_reverse(target),
+        }
+    else:
+        result = {
+            "domain"    : target,
+            "ip"        : None,
+            "target_type": "domain",
+            "timestamp" : datetime.now().isoformat(),
+            "whois"     : collect_whois(target),
+            "dns"       : collect_dns(target),
+        }
 
-        score = result["correlation_score"]
-        pair = result["pair"]
-
-        if score > 0:
-            print(f"[correlator] ⚠️  Correlação encontrada {pair}: {score}/100")
-        else:
-            print(f"[correlator] Sem correlação: {pair}")
-
-    return {
-        "domains_analyzed": domains,
-        "total_pairs": len(correlations),
-        "correlations": correlations,
-        "high_correlations": [c for c in correlations if c["correlation_score"] >= 50],
-    }
+    filepath = save_output(target.replace(".", "_"), result)
+    print(f"[collector] Resultado salvo em: {filepath}")
+    return result

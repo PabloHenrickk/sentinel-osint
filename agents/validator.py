@@ -67,28 +67,37 @@ def calculate_confidence(results: dict) -> int:
 
 def run(collected_data: dict) -> dict:
     """
-    Função principal do validador.
-    Recebe o output do collector e retorna laudo de validação.
+    Valida dados do collector.
+    Detecta automaticamente se é IP ou domínio e aplica critérios corretos.
     """
-    domain = collected_data.get("domain", "")
-    print(f"[validator] Validando dados de: {domain}")
+    target_type = collected_data.get("target_type", "domain")
+    target      = collected_data.get("domain") or collected_data.get("ip", "")
 
-    results = {
-        "domain": validate_domain(domain),
-        "whois": validate_whois(collected_data.get("whois", {})),
-        "dns": validate_dns(collected_data.get("dns", {})),
-    }
+    print(f"[validator] Validando: {target} (tipo: {target_type})")
+
+    if target_type == "ip":
+        results = {
+            "domain": {"valid": True,  "reason": "Alvo é IP — validação de formato não aplicável"},
+            "whois" : {"valid": True,  "reason": "Alvo é IP — WHOIS de domínio não aplicável"},
+            "dns"   : validate_dns(collected_data.get("dns", {})),
+        }
+    else:
+        results = {
+            "domain": validate_domain(target),
+            "whois" : validate_whois(collected_data.get("whois", {})),
+            "dns"   : validate_dns(collected_data.get("dns", {})),
+        }
 
     confidence = calculate_confidence(results)
 
     validation = {
-        "domain": domain,
+        "domain"          : target,
+        "target_type"     : target_type,
         "confidence_score": confidence,
-        "approved": confidence >= 70,
-        "checks": results,
+        "approved"        : confidence >= 70,
+        "checks"          : results,
     }
 
     status = "APROVADO" if validation["approved"] else "REPROVADO"
     print(f"[validator] {status} — confiança: {confidence}/100")
-
-    return validation   
+    return validation

@@ -50,6 +50,20 @@ def save_output(domain: str, data: dict) -> str:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return filename
 
+def collect_dns_reverse(ip: str) -> dict:
+    """
+    Para IPs: tenta resolução reversa (PTR).
+    Retorna hostnames associados ao IP, se existirem.
+    """
+    import dns.reversename
+    result = {"PTR": [], "A": [ip]}  # A já é o próprio IP
+    try:
+        reversed_name = dns.reversename.from_address(ip)
+        answers = dns.resolver.resolve(reversed_name, "PTR")
+        result["PTR"] = [str(r) for r in answers]
+    except Exception:
+        result["PTR"] = []
+    return result
 
 def run(domain: str) -> dict:
     print(f"[collector] Iniciando coleta para: {domain}")
