@@ -1,40 +1,91 @@
+"""
+correlator.py — Análise de correlação entre múltiplos alvos coletados
+
+Recebe lista de outputs do collector.py e compara todos os pares possíveis,
+identificando infraestrutura compartilhada: IPs, name servers e registrars.
+Funciona para domínios e IPs — extrai do schema padronizado do collector.
+"""
+
 from itertools import combinations
 
 
+# ---------------------------------------------------------------------------
+# Extratores de dados do schema do collector
+# ---------------------------------------------------------------------------
+
 def extract_ips(collected: dict) -> set:
     """
-    Extrai todos os IPs de um resultado coletado.
+    Extrai todos os IPs do output do collector.
+    Funciona para domínios (campo A) e para IPs (campo A = o próprio IP).
     """
     return set(collected.get("dns", {}).get("A", []))
 
 
 def extract_nameservers(collected: dict) -> set:
     """
-    Extrai name servers de um resultado coletado.
+    Extrai name servers do WHOIS.
+    IPs têm WHOIS skipped — retorna set vazio sem erro.
     Normaliza para minúsculo para comparação segura.
     """
-    ns = collected.get("whois", {}).get("name_servers", []) or []
+    whois = collected.get("whois", {})
+
+    # IPs têm whois com flag skipped — não tem name_servers
+    if whois.get("skipped"):
+        return set()
+
+    ns = whois.get("name_servers", []) or []
     return set(n.lower() for n in ns)
 
 
 def extract_registrar(collected: dict) -> str:
     """
     Extrai o registrar do WHOIS.
+    Retorna string vazia para IPs (WHOIS skipped).
     """
-    return collected.get("whois", {}).get("registrar", "") or ""
+    whois = collected.get("whois", {})
 
+    if whois.get("skipped"):
+        return ""
+
+    return whois.get("registrar", "") or ""
+
+
+def _get_label(collected: dict) -> str:
+    """
+    Retorna identificador legível do alvo — domínio ou IP.
+    Usado nos campos 'pair' do resultado.
+    """
+    return collected.get("domain") or collected.get("ip") or "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Lógica de correlação entre pares
+# ---------------------------------------------------------------------------
 
 def correlate_pair(a: dict, b: dict) -> dict:
     """
-    Compara dois resultados coletados e encontra pontos em comum.
-    Retorna dicionário com as correlações encontradas.
+    Compara dois outputs do collector e calcula score de correlação.
+
+    Pesos:
+      - IP compartilhado:       50pts (correlação forte — mesma infra)
+      - Name server comum:      30pts (correlação média — mesmo provedor DNS)
+      - Mesmo registrar:        20pts (correlação fraca — coincidência comum)
+
+    Score >= 50 indica correlação significativa.
+
+    Args:
+        a: Output do collector para o primeiro alvo.
+        b: Output do collector para o segundo alvo.
+
+    Returns:
+        dict com score, pares, IPs e NS compartilhados.
     """
-    domain_a = a.get("domain", "?")
-    domain_b = b.get("domain", "?")
+    label_a = _get_label(a)
+    label_b = _get_label(b)
 
     ips_a = extract_ips(a)
     ips_b = extract_ips(b)
-    shared_ips = ips_a & ips_b  # operador & = interseção entre sets
+    shared_ips = ips_a & ips_b       # interseção de sets
 
     ns_a = extract_nameservers(a)
     ns_b = extract_nameservers(b)
@@ -42,21 +93,18 @@ def correlate_pair(a: dict, b: dict) -> dict:
 
     registrar_a = extract_registrar(a)
     registrar_b = extract_registrar(b)
-    same_registrar = (
-        registrar_a == registrar_b and registrar_a != ""
-    )
+    same_registrar = registrar_a == registrar_b and registrar_a != ""
 
-    # calcula força da correlação
     score = 0
     if shared_ips:
-        score += 50  # mesmo IP é correlação forte
+        score += 50
     if shared_ns:
-        score += 30  # mesmo name server é correlação média
+        score += 30
     if same_registrar:
-        score += 20  # mesmo registrar é correlação fraca
+        score += 20
 
     return {
-        "pair": [domain_a, domain_b],
+        "pair": [label_a, label_b],
         "correlation_score": score,
         "shared_ips": list(shared_ips),
         "shared_nameservers": list(shared_ns),
@@ -65,36 +113,35 @@ def correlate_pair(a: dict, b: dict) -> dict:
     }
 
 
-def run(target: str) -> dict:
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def run(collected_list: list[dict]) -> list[dict]:
     """
-    Coleta WHOIS e DNS para domínio, ou apenas DNS reverso para IP.
-    Detecta automaticamente o tipo de alvo.
+    Recebe lista de outputs do collector e retorna todos os pares correlacionados.
+
+    Usa itertools.combinations para comparar todos os pares sem repetição.
+    Um batch de 10 alvos gera 45 pares — complexidade O(n²).
+
+    Args:
+        collected_list: Lista de dicts retornados por collector.run().
+
+    Returns:
+        Lista de dicts com correlações entre cada par de alvos.
     """
-    import re
-    is_ip = bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target))
+    if len(collected_list) < 2:
+        print("[correlator] Mínimo de 2 alvos necessário para correlação.")
+        return []
 
-    print(f"[collector] Iniciando coleta para: {target} ({'IP' if is_ip else 'domínio'})")
+    results = []
+    for a, b in combinations(collected_list, 2):
+        pair_result = correlate_pair(a, b)
+        results.append(pair_result)
 
-    if is_ip:
-        # IPs não têm WHOIS de domínio — coleta só o que faz sentido
-        result = {
-            "ip"        : target,
-            "domain"    : None,
-            "target_type": "ip",
-            "timestamp" : datetime.now().isoformat(),
-            "whois"     : {"skipped": "Alvo é IP — WHOIS de domínio não aplicável"},
-            "dns"       : collect_dns_reverse(target),
-        }
-    else:
-        result = {
-            "domain"    : target,
-            "ip"        : None,
-            "target_type": "domain",
-            "timestamp" : datetime.now().isoformat(),
-            "whois"     : collect_whois(target),
-            "dns"       : collect_dns(target),
-        }
+        label = f"{pair_result['pair'][0]} <-> {pair_result['pair'][1]}"
+        score = pair_result["correlation_score"]
+        strength = "FORTE" if score >= 50 else ("MÉDIA" if score >= 30 else "FRACA")
+        print(f"[correlator] {label} | score={score} | {strength}")
 
-    filepath = save_output(target.replace(".", "_"), result)
-    print(f"[collector] Resultado salvo em: {filepath}")
-    return result
+    return results
