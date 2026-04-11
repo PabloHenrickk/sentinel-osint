@@ -5,6 +5,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from core.database import Database
+
 # ── CORES ANSI ──────────────────────────────────────────────
 CY  = "\033[96m"
 GR  = "\033[92m"
@@ -221,7 +223,6 @@ def print_enrichment_summary(summary: dict):
 
 
 def print_subdomain_summary(result: dict):
-    """Exibe resumo do subdomain_agent no terminal."""
     if "error" in result:
         status_warn(f"Subdomain: {result['error']}")
         return
@@ -244,7 +245,6 @@ def print_subdomain_summary(result: dict):
 
 
 def print_header_summary(result: dict):
-    """Exibe resumo do header_agent no terminal."""
     if "error" in result and not result.get("findings"):
         status_warn(f"Headers: {result['error']}")
         return
@@ -261,7 +261,6 @@ def print_header_summary(result: dict):
           f"| {DM}Findings:{RS} {total}  "
           f"({RD}{high} HIGH{RS} · {YL}{medium} MEDIUM{RS})")
 
-    # Mostra apenas HIGH e MEDIUM para não poluir o output
     critical_findings = [
         f for f in result.get("findings", [])
         if f.get("severity") in ("HIGH", "CRITICAL")
@@ -293,16 +292,6 @@ def process_single_target(
     header_check  = _load_agent("header_agent")
     analyze       = _load_agent("ai_analyst")
     intel_report  = _load_agent("intel_reporter")
-
-    from core.database import Database
-
-    db = Database()
-    db.save_analysis(
-        target      = target,
-        analysis    = analysis,
-        json_path   = analysis.get("saved_to"),
-        report_path = report_path,   # retorno do intel_reporter.run()
-    )
 
     # coleta
     status_info("Coletando WHOIS e DNS...")
@@ -457,6 +446,7 @@ def process_single_target(
     # relatório de inteligência final
     print()
     status_info("Gerando relatório de inteligência...")
+    report_path = None
     try:
         report_path = intel_report(
             analysis  = ai_result,
@@ -465,6 +455,20 @@ def process_single_target(
         status_ok(f"Relatório → {report_path}")
     except Exception as e:
         status_warn(f"Intel reporter falhou (não crítico): {e}")
+
+    # ── persistência no SQLite ────────────────────────────────
+    # Roda após intel_reporter — assim report_path já está disponível.
+    # Falha silenciosa: banco indisponível nunca trava o pipeline.
+    try:
+        db = Database()
+        db.save_analysis(
+            target      = target,
+            analysis    = ai_result,
+            json_path   = ai_result.get("saved_to"),
+            report_path = report_path,
+        )
+    except Exception as e:
+        status_warn(f"Database index falhou (não crítico): {e}")
 
     return dados
 
@@ -546,6 +550,19 @@ def summary(aprovados: list[dict], targets: list[str]):
     label("Relatórios em    :", "data/")
     label("Logs em          :", "logs/")
     label("Concluído em     :", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # Resumo do banco ao final da sessão
+    try:
+        db  = Database()
+        dbr = db.get_summary()
+        print()
+        label("DB — Alvos       :", str(dbr["total_targets"]))
+        label("DB — Análises    :", str(dbr["total_analyses"]))
+        label("DB — Findings    :", str(dbr["total_findings"]))
+        label("DB — Críticos    :", str(dbr["critical_total"]), color=RD)
+    except Exception:
+        pass
+
     print()
 
 
