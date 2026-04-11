@@ -284,14 +284,15 @@ def process_single_target(
 
     header_section(f"ALVO {idx}/{total} — {target.upper()}")
 
-    collect      = _load_agent("collector")
-    validate     = _load_agent("validator")
-    report       = _load_agent("reporter")
-    infra_scan   = _load_agent("infra_agent")
-    enrich       = _load_agent("enrichment_agent")
-    subdomain    = _load_agent("subdomain_agent")
-    header_check = _load_agent("header_agent")
-    analyze      = _load_agent("ai_analyst")
+    collect       = _load_agent("collector")
+    validate      = _load_agent("validator")
+    report        = _load_agent("reporter")
+    infra_scan    = _load_agent("infra_agent")
+    enrich        = _load_agent("enrichment_agent")
+    subdomain     = _load_agent("subdomain_agent")
+    header_check  = _load_agent("header_agent")
+    analyze       = _load_agent("ai_analyst")
+    intel_report  = _load_agent("intel_reporter")
 
     # coleta
     status_info("Coletando WHOIS e DNS...")
@@ -442,6 +443,18 @@ def process_single_target(
                               f"[{step.get('mitre_ttp','')}]{RS}")
             else:
                 print(f"    {DM}◆ {h}{RS}")
+
+    # relatório de inteligência final
+    print()
+    status_info("Gerando relatório de inteligência...")
+    try:
+        report_path = intel_report(
+            analysis  = ai_result,
+            raw_data  = {"collected": dados, "infra": infra_result},
+        )
+        status_ok(f"Relatório → {report_path}")
+    except Exception as e:
+        status_warn(f"Intel reporter falhou (não crítico): {e}")
 
     return dados
 

