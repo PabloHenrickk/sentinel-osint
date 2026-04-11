@@ -294,6 +294,16 @@ def process_single_target(
     analyze       = _load_agent("ai_analyst")
     intel_report  = _load_agent("intel_reporter")
 
+    from core.database import Database
+
+    db = Database()
+    db.save_analysis(
+        target      = target,
+        analysis    = analysis,
+        json_path   = analysis.get("saved_to"),
+        report_path = report_path,   # retorno do intel_reporter.run()
+    )
+
     # coleta
     status_info("Coletando WHOIS e DNS...")
     dados = collect(target)
