@@ -57,12 +57,12 @@ python main.py
 ## Roadmap
 
 - [x] Estrutura do projeto
-- [ ] Agent Collector (domínio + WHOIS)
-- [ ] Agent Validator
-- [ ] Agent Correlator
-- [ ] Agent Reporter
+- [x] Agent Collector (domínio + WHOIS)
+- [x] Agent Validator
+- [x] Agent Correlator
+- [x] Agent Reporter
 - [ ] Integração com Claude como orquestrador
-- [ ] Interface de linha de comando (CLI)
+- [x] Interface de linha de comando (CLI)
 
 ## Autor
 
