@@ -20,33 +20,37 @@ SEVERITY_THRESHOLDS = {
 
 # portas conhecidas e seu risco associado
 RISKY_PORTS = {
-    21  : (Severity.HIGH,     "FTP — transferência sem criptografia"),
-    22  : (Severity.MEDIUM,   "SSH — verificar autenticação por senha"),
-    23  : (Severity.CRITICAL, "Telnet — protocolo sem criptografia"),
-    25  : (Severity.MEDIUM,   "SMTP — verificar relay aberto"),
-    80  : (Severity.LOW,      "HTTP — tráfego sem criptografia"),
-    443 : (Severity.INFO,     "HTTPS — padrão seguro"),
-    445 : (Severity.HIGH,     "SMB — vulnerável a EternalBlue/WannaCry"),
-    1433: (Severity.CRITICAL, "MSSQL — banco exposto publicamente"),
-    3306: (Severity.CRITICAL, "MySQL — banco exposto publicamente"),
-    3389: (Severity.CRITICAL, "RDP — acesso remoto exposto"),
-    5432: (Severity.CRITICAL, "PostgreSQL — banco exposto publicamente"),
-    6379: (Severity.HIGH,     "Redis — frequentemente sem autenticação"),
-    8080: (Severity.LOW,      "HTTP alternativo — verificar serviço"),
-    8443: (Severity.LOW,      "HTTPS alternativo"),
-    9200: (Severity.CRITICAL, "Elasticsearch — banco exposto publicamente"),
-    27017:(Severity.CRITICAL, "MongoDB — frequentemente sem autenticação"),
+    21   : (Severity.HIGH,     "FTP — transferência sem criptografia"),
+    22   : (Severity.MEDIUM,   "SSH — verificar autenticação por senha"),
+    23   : (Severity.CRITICAL, "Telnet — protocolo sem criptografia"),
+    25   : (Severity.MEDIUM,   "SMTP — verificar relay aberto"),
+    80   : (Severity.LOW,      "HTTP — tráfego sem criptografia"),
+    443  : (Severity.INFO,     "HTTPS — padrão seguro"),
+    445  : (Severity.HIGH,     "SMB — vulnerável a EternalBlue/WannaCry"),
+    1433 : (Severity.CRITICAL, "MSSQL — banco exposto publicamente"),
+    3306 : (Severity.CRITICAL, "MySQL — banco exposto publicamente"),
+    3389 : (Severity.CRITICAL, "RDP — acesso remoto exposto"),
+    5432 : (Severity.CRITICAL, "PostgreSQL — banco exposto publicamente"),
+    6379 : (Severity.HIGH,     "Redis — frequentemente sem autenticação"),
+    8080 : (Severity.LOW,      "HTTP alternativo — verificar serviço"),
+    8443 : (Severity.LOW,      "HTTPS alternativo"),
+    9200 : (Severity.CRITICAL, "Elasticsearch — banco exposto publicamente"),
+    9929 : (Severity.MEDIUM,   "nping-echo — ferramenta de diagnóstico Nmap exposta; verificar se intencional"),
+    27017: (Severity.CRITICAL, "MongoDB — frequentemente sem autenticação"),
+    31337: (Severity.HIGH,     "Back Orifice / backdoor histórico — porta associada a RATs e C2; investigar imediatamente"),
 }
 
 # técnicas MITRE ATT&CK por tipo de exposição
 MITRE_MAP = {
-    "database_exposed" : ("T1190", "Exploit Public-Facing Application"),
-    "rdp_exposed"      : ("T1021.001", "Remote Services: RDP"),
-    "ssh_exposed"      : ("T1021.004", "Remote Services: SSH"),
-    "ftp_exposed"      : ("T1071.002", "Application Layer Protocol: FTP"),
-    "smb_exposed"      : ("T1021.002", "Remote Services: SMB"),
-    "default_creds"    : ("T1078.001", "Valid Accounts: Default Accounts"),
-    "data_exposure"    : ("T1213", "Data from Information Repositories"),
+    "database_exposed"  : ("T1190",     "Exploit Public-Facing Application"),
+    "rdp_exposed"       : ("T1021.001", "Remote Services: RDP"),
+    "ssh_exposed"       : ("T1021.004", "Remote Services: SSH"),
+    "ftp_exposed"       : ("T1071.002", "Application Layer Protocol: FTP"),
+    "smb_exposed"       : ("T1021.002", "Remote Services: SMB"),
+    "default_creds"     : ("T1078.001", "Valid Accounts: Default Accounts"),
+    "data_exposure"     : ("T1213",     "Data from Information Repositories"),
+    "non_standard_port" : ("T1571",     "Non-Standard Port"),
+    "backdoor_port"     : ("T1571",     "Non-Standard Port — backdoor histórico ou C2"),
 }
 
 
@@ -57,6 +61,29 @@ def classify_port(port: int) -> dict:
     """
     if port in RISKY_PORTS:
         severity, description = RISKY_PORTS[port]
+
+        # Portas de backdoor recebem mapeamento MITRE explícito
+        if port == 31337:
+            mitre = MITRE_MAP["backdoor_port"]
+            return {
+                "port"        : port,
+                "severity"    : severity.value,
+                "description" : description,
+                "mitre_id"    : mitre[0],
+                "mitre_name"  : mitre[1],
+                "note"        : "31337 = 'eleet' em leet speak — uso comum em C2 e malware moderno",
+            }
+
+        if port == 9929:
+            mitre = MITRE_MAP["non_standard_port"]
+            return {
+                "port"        : port,
+                "severity"    : severity.value,
+                "description" : description,
+                "mitre_id"    : mitre[0],
+                "mitre_name"  : mitre[1],
+            }
+
         return {
             "port"       : port,
             "severity"   : severity.value,

@@ -17,54 +17,38 @@ RS  = "\033[0m"
 SESSION_DIR = Path("data/sessions")
 
 
-# ── IMPORTS LAZY — carrega agente só quando for usar ─────────
-# Motivo: se um agente tiver erro de sintaxe ou dependência
-# faltando, o sistema não cai inteiro antes do banner.
-# O erro aparece no momento exato em que o agente é chamado,
-# com contexto claro de qual alvo estava sendo processado.
-
 def _load_agent(name: str):
-    """
-    Importa um agente pelo nome e retorna sua função run().
-    Em caso de erro, retorna uma função que reporta a falha
-    sem travar o pipeline.
-    """
     try:
         import importlib
         module = importlib.import_module(f"agents.{name}")
         return module.run
     except ImportError as e:
-        # dependência faltando (ex: pacote não instalado)
+        err_msg = str(e)
         def _agent_unavailable(*args, **kwargs):
-            return {"error": f"Agente '{name}' indisponível: {e}"}
-        print(f"  {YL}⚠{RS}  Agente '{name}' não carregado: {e}")
+            return {"error": f"Agente '{name}' indisponível: {err_msg}"}
+        print(f"  {YL}⚠{RS}  Agente '{name}' não carregado: {err_msg}")
         return _agent_unavailable
     except SyntaxError as e:
-        # erro de sintaxe no código do agente
+        err_msg = str(e)
         def _agent_broken(*args, **kwargs):
-            return {"error": f"Agente '{name}' com erro de sintaxe: {e}"}
-        print(f"  {RD}✖{RS}  Agente '{name}' com erro de sintaxe: {e}")
+            return {"error": f"Agente '{name}' com erro de sintaxe: {err_msg}"}
+        print(f"  {RD}✖{RS}  Agente '{name}' com erro de sintaxe: {err_msg}")
         return _agent_broken
 
 
 # ── CHECKPOINT ──────────────────────────────────────────────
 
 def _session_path(targets: list[str]) -> Path:
-    """Gera caminho único por sessão baseado nos alvos."""
     key = "_".join(sorted(targets))[:60].replace("/", "-")
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     return SESSION_DIR / f"session_{key}.json"
 
 
 def load_session(targets: list[str]) -> dict:
-    """
-    Carrega sessão existente ou retorna estado vazio.
-    Permite retomar batch interrompido sem reprocessar alvos já concluídos.
-    """
     path = _session_path(targets)
     if path.exists():
         try:
-            state = json.loads(path.read_text(encoding="utf-8"))
+            state     = json.loads(path.read_text(encoding="utf-8"))
             completed = state.get("completed", [])
             if completed:
                 print(f"  {YL}⚠{RS}  Sessão retomada — {len(completed)} alvo(s) já processado(s)")
@@ -75,19 +59,14 @@ def load_session(targets: list[str]) -> dict:
 
 
 def save_session(state: dict, targets: list[str]) -> None:
-    """Persiste estado da sessão após cada alvo processado."""
     path = _session_path(targets)
     try:
-        path.write_text(
-            json.dumps(state, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
+        path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         print(f"  {YL}⚠{RS}  Falha ao salvar checkpoint: {e}")
 
 
 def clear_session(targets: list[str]) -> None:
-    """Remove arquivo de sessão após conclusão bem-sucedida."""
     path = _session_path(targets)
     if path.exists():
         path.unlink()
@@ -145,11 +124,18 @@ def input_targets() -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
+def input_options() -> dict:
+    """Pergunta opções de análise antes de iniciar o pipeline."""
+    print(f"\n  {CY}OPÇÕES{RS}")
+    print(f"  {DM}Enumeração de subdomínios via crt.sh (pode ser lento em domínios grandes).{RS}")
+    raw = input(f"  Habilitar subdomains? {DM}[s/N]{RS} ").strip().lower()
+    enable_subdomains = raw in ("s", "sim", "y", "yes")
+    return {"enable_subdomains": enable_subdomains}
+
+
 def print_infra_result(result: dict):
-    """Exibe resultado do infra_agent (substitui print_shodan_result)."""
     if "error" in result and not result.get("open_ports"):
         status_warn(f"Infra: {result['error']}")
-        # se houve fallback parcial, mostra qual provider foi usado
         if result.get("provider_errors"):
             for err in result["provider_errors"]:
                 print(f"      {DM}✖ {err}{RS}")
@@ -159,11 +145,11 @@ def print_infra_result(result: dict):
     cdn      = result.get("cdn_detected")
 
     print()
-    label("Provider usado",  provider,                          color=DM)
+    label("Provider usado",  provider,                         color=DM)
     label("Organização",     result.get("organization", "—"))
     label("País / Cidade",   f"{result.get('country','—')} / {result.get('city','—')}")
-    label("ASN",             result.get("asn") or "—",          color=DM)
-    label("Sistema Op.",     result.get("os") or "—",           color=DM)
+    label("ASN",             result.get("asn") or "—",         color=DM)
+    label("Sistema Op.",     result.get("os") or "—",          color=DM)
     label("Portas abertas",  str(result.get("open_ports", [])))
 
     if cdn:
@@ -185,6 +171,107 @@ def print_infra_result(result: dict):
                 print(f"        {DM}{m['technique_id']} — {m['technique_name']}{RS}")
 
 
+def print_enrichment_summary(summary: dict):
+    subdomain_count = summary.get("subdomain_count", 0)
+    cve_count       = summary.get("total_cves", 0)
+    vt_flagged      = summary.get("vt_flagged", False)
+    abuse_score     = summary.get("max_abuse_score", 0)
+    missing_headers = summary.get("missing_security_headers", [])
+    tech_stack      = summary.get("tech_stack", [])
+    server_banner   = summary.get("server_banner", "")
+    ssl_expiring    = summary.get("ssl_expiring_soon", False)
+    ssl_expired     = summary.get("ssl_expired", False)
+    exposed         = summary.get("exposed_services", [])
+
+    print()
+    if subdomain_count:
+        status_warn(f"{subdomain_count} subdomínio(s) encontrado(s) via crt.sh")
+        for s in summary.get("subdomains", [])[:5]:
+            print(f"      {DM}↳ {s}{RS}")
+
+    if cve_count:
+        status_err(f"{cve_count} CVE(s) indexado(s) no Shodan")
+        for cve in summary.get("cves", [])[:5]:
+            print(f"      {RD}↳ {cve}{RS}")
+
+    if exposed:
+        status_warn(f"{len(exposed)} serviço(s) com versão exposta:")
+        for svc in exposed[:3]:
+            print(f"      {YL}↳ Porta {svc['port']} — {svc['product']} {svc['version']}{RS}")
+
+    if vt_flagged:
+        status_err(f"VirusTotal: {summary.get('vt_malicious', 0)} engine(s) detectaram ameaça")
+
+    if abuse_score >= 25:
+        status_warn(f"AbuseIPDB: score de abuso {abuse_score}/100")
+
+    if ssl_expired:
+        status_err("Certificado SSL EXPIRADO")
+    elif ssl_expiring:
+        status_warn("Certificado SSL expira em menos de 30 dias")
+
+    if server_banner:
+        status_info(f"Banner: {server_banner}")
+
+    if tech_stack:
+        status_info(f"Stack: {', '.join(tech_stack[:4])}")
+
+    if missing_headers:
+        status_warn(f"Headers ausentes: {', '.join(missing_headers[:4])}")
+
+
+def print_subdomain_summary(result: dict):
+    """Exibe resumo do subdomain_agent no terminal."""
+    if "error" in result:
+        status_warn(f"Subdomain: {result['error']}")
+        return
+
+    active   = result.get("active_count", 0)
+    dead     = result.get("dead_count", 0)
+    takeover = result.get("takeover_candidates_count", 0)
+    total    = result.get("total_found_crt", 0)
+
+    print()
+    status_ok(f"Subdomínios — {total} no crt.sh | {active} ativos | {dead} NXDOMAIN")
+
+    if takeover:
+        status_err(f"{takeover} candidato(s) a subdomain takeover:")
+        for tc in result.get("takeover_candidates", [])[:5]:
+            print(f"      {RD}↳ {tc['name']} → {tc['cname']}{RS}")
+            print(f"         {DM}{tc['takeover_service']}{RS}")
+    elif active == 0 and total == 0:
+        status_info("Nenhum subdomínio encontrado no crt.sh")
+
+
+def print_header_summary(result: dict):
+    """Exibe resumo do header_agent no terminal."""
+    if "error" in result and not result.get("findings"):
+        status_warn(f"Headers: {result['error']}")
+        return
+
+    summary  = result.get("summary", {})
+    total    = summary.get("total_findings", 0)
+    high     = summary.get("high", 0)
+    medium   = summary.get("medium", 0)
+    status   = result.get("status_code")
+
+    print()
+    status_color = GR if status and status < 400 else YL if status else DM
+    print(f"  {DM}HTTP status:{RS} {status_color}{status or 'N/A'}{RS}  "
+          f"| {DM}Findings:{RS} {total}  "
+          f"({RD}{high} HIGH{RS} · {YL}{medium} MEDIUM{RS})")
+
+    # Mostra apenas HIGH e MEDIUM para não poluir o output
+    critical_findings = [
+        f for f in result.get("findings", [])
+        if f.get("severity") in ("HIGH", "CRITICAL")
+    ]
+    for f in critical_findings[:4]:
+        color = RD if f["severity"] == "CRITICAL" else YL
+        print(f"      {color}↳ [{f['severity']}] {f['title']}{RS}")
+        print(f"         {DM}{f['mitre_id']} — {f['mitre_name']}{RS}")
+
+
 # ── PIPELINE ─────────────────────────────────────────────────
 
 def process_single_target(
@@ -192,25 +279,24 @@ def process_single_target(
     idx: int,
     total: int,
     correlator_snapshot: dict | None,
+    enable_subdomains: bool = False,
 ) -> dict | None:
-    """
-    Executa o pipeline completo em um único alvo.
-    Carrega cada agente com lazy import — falha de um não derruba os outros.
-    """
+
     header_section(f"ALVO {idx}/{total} — {target.upper()}")
 
-    # carrega agentes com lazy import
-    collect    = _load_agent("collector")
-    validate   = _load_agent("validator")
-    report     = _load_agent("reporter")
-    infra_scan = _load_agent("infra_agent")
-    analyze    = _load_agent("ai_analyst")
+    collect      = _load_agent("collector")
+    validate     = _load_agent("validator")
+    report       = _load_agent("reporter")
+    infra_scan   = _load_agent("infra_agent")
+    enrich       = _load_agent("enrichment_agent")
+    subdomain    = _load_agent("subdomain_agent")
+    header_check = _load_agent("header_agent")
+    analyze      = _load_agent("ai_analyst")
 
     # coleta
     status_info("Coletando WHOIS e DNS...")
     dados = collect(target)
 
-    # para se a coleta falhar completamente
     if "error" in dados and not dados.get("domain") and not dados.get("ip"):
         status_err(f"Coleta falhou: {dados['error']}")
         return None
@@ -234,15 +320,9 @@ def process_single_target(
         status_warn(f"Relatório base falhou (não crítico): {e}")
 
     # reconhecimento de infraestrutura
-    # para domínio: usa IPs resolvidos pelo DNS
-    # para IP direto: usa o próprio alvo
     infra_result = None
     target_type  = dados.get("target_type", "domain")
-
-    if target_type == "ip":
-        ips = [target]
-    else:
-        ips = dados.get("dns", {}).get("A", [])
+    ips          = [target] if target_type == "ip" else dados.get("dns", {}).get("A", [])
 
     if ips:
         print()
@@ -254,52 +334,124 @@ def process_single_target(
     else:
         status_warn("Nenhum IP resolvido — reconhecimento de infra ignorado")
 
+    # enriquecimento de inteligência
+    print()
+    status_info("Enriquecendo dados (subdomínios, CVEs, fingerprint, reputação)...")
+    enrich_data = None
+    try:
+        enrich_data = enrich(
+            collected_data=dados,
+            ips=ips if ips else None,
+            infra_data=infra_result,
+        )
+        print_enrichment_summary(enrich_data.get("summary", {}))
+    except Exception as e:
+        status_warn(f"Enriquecimento falhou (não crítico): {e}")
+
+    # enumeração de subdomínios (somente para domínios, opcional)
+    subdomain_result: dict = {}
+    if enable_subdomains and target_type == "domain":
+        print()
+        status_info("Enumerando subdomínios (crt.sh + DNS)...")
+        try:
+            subdomain_result = subdomain(domain=target)
+            print_subdomain_summary(subdomain_result)
+        except Exception as e:
+            status_warn(f"Subdomain agent falhou (não crítico): {e}")
+            subdomain_result = {"error": str(e)}
+    elif enable_subdomains and target_type == "ip":
+        status_info("Subdomínios ignorados — alvo é IP, não domínio")
+
+    # análise de headers HTTP
+    print()
+    status_info("Analisando headers HTTP...")
+    header_result: dict = {}
+    try:
+        header_result = header_check(target=target)
+        print_header_summary(header_result)
+    except Exception as e:
+        status_warn(f"Header agent falhou (não crítico): {e}")
+        header_result = {"error": str(e)}
+
     # análise de IA
     print()
     status_info("Executando análise de inteligência...")
     ai_result = analyze(
         collected_data  = dados,
         validation      = validacao,
-        shodan_data     = infra_result,       # nome mantido para compatibilidade com ai_analyst
+        shodan_data     = infra_result,
         correlator_data = correlator_snapshot,
+        enrichment_data = enrich_data,
+        subdomain_data  = subdomain_result or None,
+        header_data     = header_result or None,
     )
 
-    priority = ai_result.get("priority_level", "?")
+    # ── extração compatível com schema v1 (string) e v2 (dict) ──
+    exec_summ = ai_result.get("executive_summary", {})
+
+    if isinstance(exec_summ, dict):
+        priority  = exec_summ.get("risk_level") or ai_result.get("priority_level", "INDETERMINADO")
+        summ_text = exec_summ.get("risk_justification") or exec_summ.get("risk_level", "")
+    else:
+        priority  = ai_result.get("priority_level", "INDETERMINADO")
+        summ_text = str(exec_summ) if exec_summ else ""
+
     findings = ai_result.get("findings", [])
-    summ     = ai_result.get("executive_summary", "")
 
     print()
     label("Prioridade :", priority,
-          color=RD if priority == "CRÍTICO" else
-                YL if priority == "ALTO"    else
-                GR if priority == "BAIXO"   else CY)
+          color=RD if priority in ("CRÍTICO", "CRITICAL") else
+                YL if priority in ("ALTO", "HIGH")        else
+                GR if priority in ("BAIXO", "LOW")        else CY)
     label("Achados    :", str(len(findings)))
 
-    if summ:
-        print(f"\n  {DM}{summ[:200]}{RS}")
+    if summ_text:
+        print(f"\n  {DM}{summ_text[:300]}{RS}")
 
     if findings:
         print()
         status_warn("Principais achados:")
-        for f in findings[:3]:
+        for f in findings[:5]:
             sev   = f.get("severity", "?")
             title = f.get("title", "?")
-            print(f"    {RD if sev == 'CRÍTICO' else YL}● [{sev}]{RS} {title}")
+            color = RD if sev in ("CRÍTICO", "CRITICAL") else \
+                    YL if sev in ("ALTO", "HIGH")         else DM
+
+            mitre      = f.get("mitre_attack") or {}
+            mitre_id   = mitre.get("technique_id") if isinstance(mitre, dict) else f.get("mitre_id")
+            mitre_name = mitre.get("technique")    if isinstance(mitre, dict) else f.get("mitre_name")
+
+            print(f"    {color}● [{sev}]{RS} {title}")
+            if mitre_id:
+                print(f"       {DM}{mitre_id} — {mitre_name or ''}{RS}")
+
+    # hipóteses adversariais (v2)
+    hypotheses = ai_result.get("attack_hypotheses", [])
+    if hypotheses:
+        print()
+        status_warn(f"{len(hypotheses)} hipótese(s) adversarial(is):")
+        for h in hypotheses[:3]:
+            if isinstance(h, dict):
+                name  = h.get("name", "?")
+                prob  = h.get("probability", "")
+                color = RD if prob == "HIGH" else YL if prob == "MEDIUM" else DM
+                print(f"    {color}◆ {name}  [{prob}]{RS}")
+                for step in h.get("kill_chain", [])[:3]:
+                    if isinstance(step, dict):
+                        print(f"       {DM}{step.get('step','?')}. {step.get('action','')}  "
+                              f"[{step.get('mitre_ttp','')}]{RS}")
+            else:
+                print(f"    {DM}◆ {h}{RS}")
 
     return dados
 
 
-def run_pipeline(targets: list[str]) -> list[dict]:
-    """
-    Executa pipeline com checkpoint por alvo.
-    Retoma sessão interrompida automaticamente.
-    """
+def run_pipeline(targets: list[str], enable_subdomains: bool = False) -> list[dict]:
     state     = load_session(targets)
     completed = set(state.get("completed", []))
     aprovados = state.get("aprovados", [])
     total     = len(targets)
 
-    # carrega correlator uma vez (usado em todo o loop)
     correlate = _load_agent("correlator")
 
     for idx, target in enumerate(targets, 1):
@@ -308,7 +460,6 @@ def run_pipeline(targets: list[str]) -> list[dict]:
             status_info(f"[{idx}/{total}] {target} — já processado, pulando")
             continue
 
-        # correlação parcial dos aprovados até agora
         correlator_snapshot = None
         if len(aprovados) >= 2:
             try:
@@ -321,6 +472,7 @@ def run_pipeline(targets: list[str]) -> list[dict]:
             idx                 = idx,
             total               = total,
             correlator_snapshot = correlator_snapshot,
+            enable_subdomains   = enable_subdomains,
         )
 
         if resultado:
@@ -343,7 +495,7 @@ def run_correlation(aprovados: list[dict]):
     header_section("CORRELAÇÃO FINAL ENTRE ALVOS")
     status_info(f"Analisando {len(aprovados)} alvo(s)...")
 
-    resultado = correlate(aprovados)          # list[dict]
+    resultado = correlate(aprovados)
     high      = [c for c in resultado if c.get("correlation_score", 0) >= 50]
 
     if high:
@@ -356,7 +508,7 @@ def run_correlation(aprovados: list[dict]):
             if c.get("shared_ips"):
                 print(f"      {DM}IPs: {c['shared_ips']}{RS}")
             if c.get("shared_nameservers"):
-                print(f"        {DM}NS: {c['shared_nameservers']}{RS}")
+                print(f"      {DM}NS: {c['shared_nameservers']}{RS}")
             if c.get("same_registrar"):
                 print(f"      {DM}Registrar: {c['registrar']}{RS}")
     else:
@@ -378,9 +530,10 @@ if __name__ == "__main__":
     clear()
     banner()
 
-    # agentes carregados APÓS o banner — erro aparece com contexto visual
-    targets   = input_targets()
-    aprovados = run_pipeline(targets)
+    targets = input_targets()
+    options = input_options()
+
+    aprovados = run_pipeline(targets, enable_subdomains=options["enable_subdomains"])
 
     run_correlation(aprovados)
     summary(aprovados, targets)
