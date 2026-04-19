@@ -5,6 +5,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from core.input_resolver import normalize
+from core.txt_parser import parse as parse_txt
 
 from core.database import Database
 
@@ -118,8 +120,14 @@ def header_section(title: str):
 
 def input_targets() -> list[str]:
     print(f"\n  {CY}ALVOS{RS}")
-    print(f"  {DM}Domínios, IPs ou mix separados por vírgula.{RS}")
-    print(f"  {DM}Exemplos: google.com  |  8.8.8.8  |  github.com, 1.1.1.1{RS}\n")
+    print(f"  {DM}Aceita qualquer formato — o sistema detecta e roteia automaticamente.{RS}")
+    print(f"  {DM}Exemplos:{RS}")
+    print(f"  {DM}  domínio   →  petrobras.com.br{RS}")
+    print(f"  {DM}  IP        →  45.33.32.156{RS}")
+    print(f"  {DM}  URL       →  https://github.com/PabloHenrickk{RS}")
+    print(f"  {DM}  e-mail    →  contato@empresa.com.br{RS}")
+    print(f"  {DM}  CNPJ      →  33.000.167/0001-01{RS}")
+    print(f"  {DM}  múltiplos →  google.com, 8.8.8.8, 12.345.678/0001-90{RS}\n")
     raw = input(f"  {BLD}>{RS} ").strip()
     if not raw:
         status_err("Nenhum alvo informado.")
@@ -271,8 +279,48 @@ def print_header_summary(result: dict):
         print(f"      {color}↳ [{f['severity']}] {f['title']}{RS}")
         print(f"         {DM}{f['mitre_id']} — {f['mitre_name']}{RS}")
 
+def print_gov_summary(result: dict):
+    if "error" in result:
+        status_warn(f"Gov Agent: {result['error']}")
+        return
+
+    summary  = result.get("summary", {})
+    risk     = summary.get("risk_level", "UNKNOWN")
+    sanction = summary.get("sanction_count", 0)
+    contracts = summary.get("total_contracts", 0)
+    value    = summary.get("total_contract_value", 0.0)
+    convenios = summary.get("total_convenios", 0)
+
+    risk_color = RD if risk == "CRITICAL" else YL if risk == "HIGH" else GR if risk == "LOW" else CY
+
+    print()
+    label("CNPJ          :", result.get("cnpj_formatted", "—"))
+    label("Risco Gov     :", risk, color=risk_color)
+    label("Contratos     :", f"{contracts}  (R$ {value:,.2f})")
+    label("Convênios     :", str(convenios))
+    label("Sanções       :", str(sanction), color=RD if sanction else GR)
+
+    if sanction:
+        all_s = result.get("sanctions_ceis", []) + result.get("sanctions_cnep", [])
+        for s in all_s[:3]:
+            tipo = s.get("type", "?")
+            desc = s.get("sanction_type", s.get("tipoSancao", "?"))
+            org  = s.get("sanctioning_organ", s.get("orgaoSancionador", "?"))
+            print(f"      {RD}↳ [{tipo}] {desc} — {org}{RS}")
+
+    findings = result.get("gov_intel_findings", [])
+    if findings:
+        print()
+        status_warn(f"{len(findings)} finding(s) governamental(is):")
+        for f in findings[:3]:
+            sev   = f.get("severity", "?")
+            title = f.get("title", "?")
+            color = RD if sev == "CRITICAL" else YL if sev == "HIGH" else DM
+            print(f"    {color}● [{sev}]{RS} {title}")
+
 
 # ── PIPELINE ─────────────────────────────────────────────────
+
 
 def process_single_target(
     target: str,
@@ -280,7 +328,22 @@ def process_single_target(
     total: int,
     correlator_snapshot: dict | None,
     enable_subdomains: bool = False,
+    resolved: dict = None,
 ) -> dict | None:
+
+    # Banner com tipo detectado
+    input_label = ""
+    if resolved:
+        type_labels = {
+            "domain": "DOMÍNIO",
+            "ip":     "IP DIRETO",
+            "url":    "URL",
+            "email":  "E-MAIL",
+        }
+        tipo = type_labels.get(resolved["original_type"], resolved["original_type"].upper())
+        input_label = f" [{tipo}]"
+        if resolved["original_type"] != resolved["target_type"]:
+            input_label += f"  {DM}({resolved['routing_note']}){RS}"
 
     header_section(f"ALVO {idx}/{total} — {target.upper()}")
 
@@ -298,19 +361,36 @@ def process_single_target(
     status_info("Coletando WHOIS e DNS...")
     dados = collect(target)
 
-    if "error" in dados and not dados.get("domain") and not dados.get("ip"):
-        status_err(f"Coleta falhou: {dados['error']}")
-        return None
+    # TXT Intelligence — extrai tecnologia e superfície de ataque dos registros TXT
+    txt_records   = dados.get("dns", {}).get("TXT", [])
+    txt_intel     = parse_txt(txt_records)
+    if txt_intel["total_services"] > 0:
+        status_info(
+            f"TXT Intelligence — {txt_intel['total_services']} serviço(s) detectado(s): "
+            f"{', '.join(txt_intel['categories_found'])}"
+        )
+        if "HIGH" in txt_intel["email_security_risk"] or "CRITICAL" in txt_intel["email_security_risk"]:
+            status_warn(f"E-mail security: {txt_intel['email_security_risk']}")
+
+        if "error" in dados and not dados.get("domain") and not dados.get("ip"):
+            status_err(f"Coleta falhou: {dados['error']}")
+            return None
 
     # validação
+    # DEPOIS
     validacao = validate(dados)
     score     = validacao.get("confidence_score", 0)
 
     if not validacao.get("approved"):
-        status_err(f"Reprovado — score {score}/100")
+        status_err(f"Reprovado — DNS não resolveu, análise impossível")
         return None
 
-    status_ok(f"Validado — confiança {score}/100")
+    # Warnings de qualidade (WHOIS parcial, score baixo) — não bloqueiam
+    for w in validacao.get("warnings", []):
+        status_warn(w)
+
+    qualifier = "" if score >= 70 else " com ressalvas"
+    status_ok(f"Validado{qualifier} — confiança {score}/100")
 
     # relatório base
     status_info("Gerando relatório base...")
@@ -480,12 +560,58 @@ def run_pipeline(targets: list[str], enable_subdomains: bool = False) -> list[di
 
     correlate = _load_agent("correlator")
 
-    for idx, target in enumerate(targets, 1):
+    for idx, raw_target in enumerate(targets, 1):
 
-        if target in completed:
-            status_info(f"[{idx}/{total}] {target} — já processado, pulando")
+        if raw_target in completed:
+            status_info(f"[{idx}/{total}] {raw_target} — já processado, pulando")
             continue
 
+        # ── Resolve e roteia o input ──────────────────────────────────────
+        resolved = normalize(raw_target)
+        input_type = resolved["original_type"]
+
+        # Tipos ainda não implementados — avisa e pula
+        if input_type == "asn":
+            print()
+            line()
+            status_warn(f"ASN detectado: {resolved['target']} — expansão de bloco em desenvolvimento")
+            status_info("Disponível na Fase 3. Use IPs individuais por enquanto.")
+            completed.add(raw_target)
+            state["completed"] = list(completed)
+            save_session(state, targets)
+            continue
+
+        if resolved.get("requires_gov_agent"):
+            print()
+            line()
+            cnpj_fmt = resolved["metadata"].get("cnpj_formatted", resolved["target"])
+            header_section(f"ALVO {idx}/{total} — GOV INTELLIGENCE — {cnpj_fmt}")
+
+            gov_agent = _load_agent("gov_agent")
+            status_info(f"Consultando Portal da Transparência para CNPJ {cnpj_fmt}...")
+
+            gov_result = gov_agent(resolved)
+            print_gov_summary(gov_result)
+
+            # persiste no SQLite reaproveitando a estrutura de análise
+            try:
+                db = Database()
+                db.save_analysis(
+                    target      = resolved["target"],
+                    analysis    = {"findings": gov_result.get("gov_intel_findings", []),
+                                "executive_summary": gov_result.get("summary", {})},
+                    json_path   = None,
+                    report_path = None,
+                )
+            except Exception as e:
+                status_warn(f"Database index falhou (não crítico): {e}")
+
+            completed.add(raw_target)
+            state["completed"] = list(completed)
+            save_session(state, targets)
+            continue
+
+        # ── Pipeline padrão ───────────────────────────────────────────────
         correlator_snapshot = None
         if len(aprovados) >= 2:
             try:
@@ -494,19 +620,20 @@ def run_pipeline(targets: list[str], enable_subdomains: bool = False) -> list[di
                 correlator_snapshot = None
 
         resultado = process_single_target(
-            target              = target,
+            target              = resolved["target"],
             idx                 = idx,
             total               = total,
             correlator_snapshot = correlator_snapshot,
             enable_subdomains   = enable_subdomains,
+            resolved            = resolved,
         )
 
         if resultado:
             aprovados.append(resultado)
 
-        state["completed"] = list(completed | {target})
+        state["completed"] = list(completed | {raw_target})
         state["aprovados"] = aprovados
-        completed.add(target)
+        completed.add(raw_target)
         save_session(state, targets)
 
     return aprovados
