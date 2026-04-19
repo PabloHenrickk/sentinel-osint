@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import sys
@@ -457,8 +458,6 @@ def process_single_target(
         status_warn(f"Intel reporter falhou (não crítico): {e}")
 
     # ── persistência no SQLite ────────────────────────────────
-    # Roda após intel_reporter — assim report_path já está disponível.
-    # Falha silenciosa: banco indisponível nunca trava o pipeline.
     try:
         db = Database()
         db.save_analysis(
@@ -551,7 +550,6 @@ def summary(aprovados: list[dict], targets: list[str]):
     label("Logs em          :", "logs/")
     label("Concluído em     :", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    # Resumo do banco ao final da sessão
     try:
         db  = Database()
         dbr = db.get_summary()
@@ -566,19 +564,122 @@ def summary(aprovados: list[dict], targets: list[str]):
     print()
 
 
+# ── CLI FLAGS ────────────────────────────────────────────────
+
+def _parse_cli_flags() -> argparse.Namespace:
+    """
+    Lê flags opcionais da CLI sem quebrar o fluxo interativo.
+    Uso: python main.py --deep --cnpj 12345678000199
+    Sem flags: comportamento 100% idêntico ao atual.
+    parse_known_args ignora argumentos desconhecidos — não quebra nada.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--deep", action="store_true", default=False)
+    parser.add_argument("--cnpj", default="")
+    flags, _ = parser.parse_known_args()
+    return flags
+
+
+# ── DEEP MODE ────────────────────────────────────────────────
+
+def run_deep_mode(aprovados: list[dict], flags: argparse.Namespace) -> None:
+    """
+    Executa o deep pipeline para cada alvo aprovado no pipeline padrão.
+    Só chamado se --deep foi passado. Pipeline padrão nunca é afetado.
+    """
+    from core.deep_pipeline import run_deep
+
+    header_section("DEEP INTELLIGENCE MODE")
+    status_info(f"Processando {len(aprovados)} alvo(s) aprovado(s)...")
+
+    if flags.cnpj:
+        status_info(f"CNPJ fornecido: {flags.cnpj}")
+
+    for target_data in aprovados:
+        target_str = (
+            target_data.get("domain")
+            or target_data.get("ip")
+            or target_data.get("target", "")
+        )
+        if not target_str:
+            status_warn("Alvo sem domínio/IP identificável — pulando deep mode")
+            continue
+
+        print()
+        line()
+        status_info(f"Deep pipeline → {target_str}")
+
+        deep_args = argparse.Namespace(
+            target=target_str,
+            cnpj=flags.cnpj,
+        )
+
+        try:
+            result = run_deep(deep_args)
+            risk   = result["metadata"]["risk_summary"]
+            stats  = result["metadata"]["stats"]
+
+            print()
+            label("Nós no grafo   :", str(stats["total_nodes"]))
+            label("Arestas        :", str(stats["total_edges"]))
+            label("Correlações    :", str(stats["correlations"]))
+            label("Risk score     :", str(risk["total_risk_score"]),
+                  color=RD if risk["total_risk_score"] > 60 else
+                        YL if risk["total_risk_score"] > 30 else GR)
+            label("High risk nós  :", str(risk["high_risk_count"]),
+                  color=RD if risk["high_risk_count"] > 0 else GR)
+            label("Output         :", result["metadata"].get("output_path", "—"), color=DM)
+
+            print()
+            if risk.get("has_sanctioned_entity"):
+                status_err("EMPRESA CONSTA NO CEIS/CNEP")
+            if risk.get("has_cves"):
+                status_warn("CVEs detectados na infraestrutura")
+            if risk.get("has_high_abuse_ip"):
+                status_warn("IP com score de abuso elevado (AbuseIPDB > 50)")
+            if not any([
+                risk.get("has_sanctioned_entity"),
+                risk.get("has_cves"),
+                risk.get("has_high_abuse_ip"),
+            ]):
+                status_ok("Nenhum indicador crítico detectado no deep scan")
+
+        except Exception as e:
+            status_warn(f"Deep pipeline falhou para {target_str}: {e}")
+
+
+# ── ENTRY POINT ──────────────────────────────────────────────
+
 if __name__ == "__main__":
     clear()
     banner()
 
+    # Lê flags opcionais — não altera fluxo interativo
+    flags = _parse_cli_flags()
+
+    # Indica modo ativo no banner
+    if flags.deep:
+        status_info(f"Modo: {BLD}DEEP INTELLIGENCE{RS} ativo")
+        if flags.cnpj:
+            status_info(f"CNPJ: {flags.cnpj}")
+        print()
+
     targets = input_targets()
     options = input_options()
 
+    # Pipeline padrão — intocado
     aprovados = run_pipeline(targets, enable_subdomains=options["enable_subdomains"])
 
     run_correlation(aprovados)
     summary(aprovados, targets)
 
     clear_session(targets)
+
+    # Deep mode — só executa se --deep foi passado e há alvos aprovados
+    if flags.deep and aprovados:
+        run_deep_mode(aprovados, flags)
+    elif flags.deep and not aprovados:
+        status_warn("Deep mode ativo mas nenhum alvo foi aprovado no pipeline padrão.")
 
     line(color=CY)
     print(f"\n  {DM}Sentinel OSINT — uso ético e responsável{RS}\n")

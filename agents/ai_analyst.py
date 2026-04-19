@@ -8,6 +8,34 @@ Arquitetura Multi-IA (quando Ollama disponível):
   - Ollama local (modelo leve) comprime contexto grande antes de enviar ao Groq
   - Isso resolve truncamento por limite de tokens e reduz custo de API
   - Ativado automaticamente quando contexto > _COMPRESSION_THRESHOLD chars
+
+Fix v1.2 — Token budget corrigido:
+  - _estimate_tokens() usa ratio 2.5 chars/token (era 4 — subestimava 58%)
+  - _GROQ_INPUT_CHAR_BUDGET recalculado com ratio 2.5
+  - _MAX_CONTEXT_CHARS reduzido de 14.000 → 8.000 (ratio correto expõe margem real)
+  - _COMPRESSION_THRESHOLD reduzido de 10.000 → 6.000 (dispara antes do safety net)
+
+Fix v1.3 — Budget dinâmico por system prompt real:
+  - Bug raiz: 3 Skills = ~27.000 chars / ~10.800 tokens — sozinhas excedem o budget de 8.500
+  - _GROQ_INPUT_CHAR_BUDGET era hardcoded e nunca descontava o system prompt
+  - call_model() agora mede system_prompt REAL e calcula data_budget_chars dinamicamente
+  - run() aplica pre-truncamento ciente do system_prompt antes de chamar call_model()
+  - Fallback: se skills > budget, trunca o system_prompt e loga aviso CRITICAL
+
+Fix v1.4 — Budget separado por provider:
+  - Bug raiz: limite de 8.500 tokens (Groq free tier) era aplicado ao OpenRouter também
+  - OpenRouter + Nemotron 3 Super tem 262K tokens de contexto — 30x maior
+  - Groq: mantém lógica de budget rígido (12K TPM)
+  - OpenRouter: safety net generoso de 400K chars (~160K tokens) — sem truncamento agressivo
+  - Ollama: safety net simples por chars
+  - call_openrouter() agora inclui max_tokens para garantir output completo
+
+Fix v1.5 — Timeout de compressão Ollama:
+  - Bug raiz: ollama.chat() não aceita parâmetro timeout diretamente
+  - Solução: instancia ollama.Client com timeout=30 antes de chamar .chat()
+  - Sem timeout, pipeline travava indefinidamente se llama3.2 não respondia na CPU
+  - Para remover: substitua _timed_client.chat() por ollama_client.chat() e apague
+    as duas linhas de instanciação do _timed_client
 """
 
 import json
@@ -44,12 +72,54 @@ MEMORY_FILES = {
     "corrections": MEMORY_DIR / "error_corrections.json",
 }
 
-_MAX_CONTEXT_CHARS        = 32_000
-_COMPRESSION_THRESHOLD    = 24_000
-_MAX_SUBDOMAINS_IN_CONTEXT = 20
-_MAX_SANS_IN_CONTEXT       = 15
-_MAX_CVE_IN_CONTEXT        = 10
-_MAX_BANNER_CHARS          = 120
+# ── Limites por provider ───────────────────────────────────────────────────
+#
+# GROQ free tier: 12.000 TPM (tokens por minuto, input + output somados)
+#   Output reservado: 3.500 tokens → input budget: 8.500 tokens
+#   Ratio 2.5 chars/token → budget real: ~8.000 chars para dados
+#
+# OPENROUTER + Nemotron 3 Super: 262.144 tokens de contexto
+#   Sem limite de TPM restritivo como o Groq free tier
+#   Safety net: 400.000 chars (~160.000 tokens) — margem de segurança de 40%
+#   Compressão Ollama: desabilitada por padrão (não necessária)
+#
+# OLLAMA: sem limite de tokens na API, limitado apenas pela RAM/VRAM
+#   Safety net: 80.000 chars por conservadorismo
+
+_GROQ_FREE_TPM              = 12_000
+_GROQ_MAX_OUTPUT_TOKENS     = 3_500
+_GROQ_CHARS_PER_TOKEN       = 2.5
+
+_OPENROUTER_MAX_CONTEXT_CHARS = 400_000   # ~160K tokens — bem dentro dos 262K do Nemotron
+_OPENROUTER_MAX_OUTPUT_TOKENS = 8_000     # mais output que o Groq free tier
+
+_OLLAMA_MAX_CONTEXT_CHARS     = 80_000
+
+# Threshold para acionar compressão via Ollama local (apenas Groq)
+_COMPRESSION_THRESHOLD        = 6_000
+
+# Limites de truncamento de campos específicos (aplicados antes de montar o contexto)
+_MAX_SUBDOMAINS_IN_CONTEXT = 8
+_MAX_SANS_IN_CONTEXT       = 6
+_MAX_CVE_IN_CONTEXT        = 5    # Groq: 5 | OpenRouter: expandido em _build_enrichment_block
+_MAX_BANNER_CHARS          = 60
+
+# Versões expandidas para OpenRouter (contexto grande)
+_MAX_CVE_OPENROUTER        = 30
+_MAX_SUBDOMAINS_OPENROUTER = 30
+_MAX_BANNER_OPENROUTER     = 200
+
+
+def _estimate_tokens(system: str, context: str) -> int:
+    """
+    Aproxima o total de tokens enviados ao provider (system + data context).
+    Ratio 2.5 chars/token — calibrado empiricamente para conteúdo técnico com CVEs/IPs/JSON.
+    """
+    return int((len(system) + len(context)) / _GROQ_CHARS_PER_TOKEN)
+
+
+def _get_provider() -> str:
+    return os.getenv("AI_PROVIDER", "groq").lower().strip()
 
 
 # ── Schemas Pydantic v2.0 ─────────────────────────────────────────────────
@@ -162,7 +232,7 @@ class AnalysisOutput(BaseModel):
     domain_intelligence         : Optional[dict]                  = None
     technology_fingerprint      : Optional[dict]                  = None
     reputation_analysis         : Optional[dict]                  = None
-    priority_level   : Optional[str] = Field(None, description="CRÍTICO|ALTO|MÉDIO|BAIXO|INFO")
+    priority_level   : Optional[str] = Field(None, description="CRITICAL|HIGH|MEDIUM|LOW|INFO")
     threat_hypotheses: list[str]     = Field(default_factory=list)
     recommendations  : list[str]     = Field(default_factory=list)
     confidence_score : Optional[int] = Field(None, ge=0, le=100)
@@ -291,34 +361,51 @@ def build_system_prompt(skills: str, memory: str) -> str:
     ]
     if memory:
         parts += ["", "## MEMÓRIA ATIVA — aplicar em toda análise", memory]
+
+    parts += [
+        "",
+        "## LIMITE DE OUTPUT — OBRIGATÓRIO",
+        "Seja extremamente conciso. Cada campo de string: máximo 80 caracteres.",
+        "realistic_scenario: máximo 2 frases. description: máximo 1 frase.",
+        "Priorize completar o JSON válido sobre detalhar cada campo.",
+    ]
+
     return "\n".join(parts)
 
 
 # ── Truncamento de contexto ───────────────────────────────────────────────
 
-def _truncate_enrichment_sources(sources: dict) -> dict:
+def _truncate_enrichment_sources(sources: dict, provider: str = "groq") -> dict:
+    """
+    Trunca fontes de enriquecimento antes de montar o contexto.
+    Provider openrouter usa limites expandidos — aproveita 262K de contexto.
+    """
     import copy
     s = copy.deepcopy(sources)
+
+    max_subs    = _MAX_SUBDOMAINS_OPENROUTER if provider == "openrouter" else _MAX_SUBDOMAINS_IN_CONTEXT
+    max_cves    = _MAX_CVE_OPENROUTER        if provider == "openrouter" else _MAX_CVE_IN_CONTEXT
+    max_banners = _MAX_BANNER_OPENROUTER     if provider == "openrouter" else _MAX_BANNER_CHARS
 
     subs      = s.get("subdomains", {})
     all_subs: list = subs.get("subdomains", [])
     total     = subs.get("count", len(all_subs))
-    if total > _MAX_SUBDOMAINS_IN_CONTEXT:
+    if total > max_subs:
         s["subdomains"] = {
             "count" : total,
-            "sample": all_subs[:_MAX_SUBDOMAINS_IN_CONTEXT],
-            "note"  : f"{total - _MAX_SUBDOMAINS_IN_CONTEXT} subdomínios omitidos — total: {total}",
+            "sample": all_subs[:max_subs],
+            "note"  : f"{total - max_subs} subdomínios omitidos — total: {total}",
         }
 
     for shodan in s.get("shodan", []):
         for svc in shodan.get("services", []):
             banner = svc.get("banner", "")
-            if len(banner) > _MAX_BANNER_CHARS:
-                svc["banner"] = banner[:_MAX_BANNER_CHARS] + "...[truncado]"
-            if len(svc.get("cves", [])) > _MAX_CVE_IN_CONTEXT:
-                svc["cves"] = svc["cves"][:_MAX_CVE_IN_CONTEXT]
-        if len(shodan.get("all_cves", [])) > _MAX_CVE_IN_CONTEXT:
-            shodan["all_cves"] = shodan["all_cves"][:_MAX_CVE_IN_CONTEXT]
+            if len(banner) > max_banners:
+                svc["banner"] = banner[:max_banners] + "...[truncado]"
+            if len(svc.get("cves", [])) > max_cves:
+                svc["cves"] = svc["cves"][:max_cves]
+        if len(shodan.get("all_cves", [])) > max_cves:
+            shodan["all_cves"] = shodan["all_cves"][:max_cves]
 
     http = s.get("http", {})
     http.pop("headers", None)
@@ -334,20 +421,25 @@ def _truncate_enrichment_sources(sources: dict) -> dict:
     return s
 
 
-def _build_enrichment_block(enrichment_data: dict) -> list[str]:
+def _build_enrichment_block(enrichment_data: dict, provider: str = "groq") -> list[str]:
     s                 = enrichment_data.get("summary", {})
-    sources_truncated = _truncate_enrichment_sources(enrichment_data.get("sources", {}))
+    sources_truncated = _truncate_enrichment_sources(
+        enrichment_data.get("sources", {}), provider=provider
+    )
+
+    max_subs = _MAX_SUBDOMAINS_OPENROUTER if provider == "openrouter" else _MAX_SUBDOMAINS_IN_CONTEXT
+    max_cves = _MAX_CVE_OPENROUTER        if provider == "openrouter" else _MAX_CVE_IN_CONTEXT
 
     summary_subs: list = s.get("subdomains", [])
-    sub_count  = s.get("subdomain_count", len(summary_subs))
-    sub_display = ", ".join(summary_subs[:_MAX_SUBDOMAINS_IN_CONTEXT])
-    if sub_count > _MAX_SUBDOMAINS_IN_CONTEXT:
-        sub_display += f" ... (+{sub_count - _MAX_SUBDOMAINS_IN_CONTEXT} omitidos)"
+    sub_count   = s.get("subdomain_count", len(summary_subs))
+    sub_display = ", ".join(summary_subs[:max_subs])
+    if sub_count > max_subs:
+        sub_display += f" ... (+{sub_count - max_subs} omitidos)"
 
     summary_cves: list = s.get("cves", [])
-    cves_display = ", ".join(summary_cves[:_MAX_CVE_IN_CONTEXT])
-    if len(summary_cves) > _MAX_CVE_IN_CONTEXT:
-        cves_display += f" ... (+{len(summary_cves) - _MAX_CVE_IN_CONTEXT} omitidos)"
+    cves_display = ", ".join(summary_cves[:max_cves])
+    if len(summary_cves) > max_cves:
+        cves_display += f" ... (+{len(summary_cves) - max_cves} omitidos)"
 
     summary_sans: list = s.get("ssl_sans", [])
     sans_display = ", ".join(summary_sans[:_MAX_SANS_IN_CONTEXT])
@@ -388,10 +480,6 @@ def _build_enrichment_block(enrichment_data: dict) -> list[str]:
 
 
 def _build_subdomain_block(subdomain_data: dict) -> list[str]:
-    """
-    Monta bloco de subdomínios para o contexto do LLM.
-    Prioriza takeover candidates — são os dados mais críticos.
-    """
     total    = subdomain_data.get("total_found_crt", 0)
     active   = subdomain_data.get("active_count", 0)
     takeover = subdomain_data.get("takeover_candidates", [])
@@ -414,7 +502,6 @@ def _build_subdomain_block(subdomain_data: dict) -> list[str]:
                 f"| Serviço: {tc.get('takeover_service')}"
             )
 
-    # Lista de ativos — limitada para não inflar o contexto
     active_list = [
         s for s in subdomain_data.get("subdomains", [])
         if s.get("status") == "resolved"
@@ -422,7 +509,7 @@ def _build_subdomain_block(subdomain_data: dict) -> list[str]:
 
     if active_list:
         lines.append("")
-        lines.append(f"Ativos (amostra de {len(active_list)}):")
+        lines.append(f"Ativos (amostra de {len(active_list)} de {active}):")
         for s in active_list:
             ips = ", ".join(s.get("ips", []))
             lines.append(f"  - {s['name']} → {ips}")
@@ -431,10 +518,6 @@ def _build_subdomain_block(subdomain_data: dict) -> list[str]:
 
 
 def _build_header_block(header_data: dict) -> list[str]:
-    """
-    Monta bloco de análise de headers para o contexto do LLM.
-    Inclui findings já classificados com MITRE — o LLM consolida, não reanalisa.
-    """
     summary  = header_data.get("summary", {})
     findings = header_data.get("findings", [])
     status   = header_data.get("status_code")
@@ -453,10 +536,10 @@ def _build_header_block(header_data: dict) -> list[str]:
         lines.append("")
         lines.append("Findings por header:")
         for f in findings:
-            sev  = f.get("severity", "?")
+            sev   = f.get("severity", "?")
             title = f.get("title", "?")
-            mid  = f.get("mitre_id", "")
-            ev   = f.get("evidence", "")[:120]
+            mid   = f.get("mitre_id", "")
+            ev    = f.get("evidence", "")[:60]
             lines.append(f"  [{sev}] {title} | {mid} | {ev}")
 
     return lines
@@ -533,14 +616,6 @@ def _build_analysis_instruction(
         "Passos vagos como explorar o servico ou obter acesso sao INVALIDOS.",
         "Cada passo deve ter acao especifica + ferramenta quando aplicavel + TTP MITRE.",
         "",
-        "Exemplos VALIDOS:",
-        "  Identificar OpenSSH 6.6.1 no banner via: nmap -sV -p22 45.33.32.156",
-        "  Executar brute force: hydra -l root -P rockyou.txt 45.33.32.156 ssh",
-        "  Obter shell com credencial valida -- controle total do host",
-        "",
-        "Exemplos INVALIDOS (nao use):",
-        "  Explorar a porta 22 / Obter acesso nao autorizado / Executar codigo malicioso",
-        "",
         "HIPOTESES — minimo 2:",
         "  H-001: caminho de menor resistencia (atacante oportunista em 1h)",
         "  H-002: maior impacto potencial (APT ou ransomware)",
@@ -551,7 +626,7 @@ def _build_analysis_instruction(
         instructions += [
             "",
             "TAKEOVER CANDIDATES detectados -> finding CRITICAL para cada um.",
-            "Kill chain: 1. Identificar CNAME para servico nao reivindicado",
+            "Kill chain: 1. Identificar CNAME nao reivindicado",
             "            2. Registrar conta no servico (GitHub Pages, Heroku, etc)",
             "            3. Reivindicar subdominio e hospedar payload malicioso",
             "MITRE: T1584.001",
@@ -606,8 +681,19 @@ def _compress_context_ollama(context: str) -> str:
     )
 
     try:
-        import ollama as ollama_client
-        response = ollama_client.chat(
+        import ollama as _ollama_module
+
+        # FIX v1.5 — ollama.chat() não aceita timeout como parâmetro direto.
+        # Instancia o Client com timeout configurado para evitar travamento
+        # indefinido quando o modelo local não responde (CPU lenta, modelo
+        # não carregado, etc). Após 30s desiste e usa contexto original.
+        # Para remover este fix: substitua _timed_client.chat() por
+        # ollama_module.chat() e apague as duas linhas de instanciação abaixo.
+        _timed_client = _ollama_module.Client(
+            host="http://localhost:11434",
+            timeout=30,
+        )
+        response = _timed_client.chat(
             model=compress_model,
             messages=[
                 {"role": "system", "content": compression_prompt},
@@ -638,7 +724,7 @@ def call_groq(system_prompt: str, data_context: str, model: str) -> str:
         json={
             "model"      : model,
             "temperature": 0.1,
-            "max_tokens" : 8192,
+            "max_tokens" : _GROQ_MAX_OUTPUT_TOKENS,
             "messages"   : [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": data_context},
@@ -667,16 +753,29 @@ def call_openrouter(system_prompt: str, data_context: str, model: str) -> str:
         json={
             "model"      : model,
             "temperature": 0.1,
+            "max_tokens" : _OPENROUTER_MAX_OUTPUT_TOKENS,
             "messages"   : [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": data_context},
             ],
         },
-        timeout=120,
+        timeout=180,
     )
-    if response.status_code != 200:
-        raise RuntimeError(f"OpenRouter retornou {response.status_code}: {response.text[:300]}")
-    return response.json()["choices"][0]["message"]["content"]
+
+    raw = response.json()
+
+    # Log completo da resposta para diagnóstico — remove após estabilizar
+    if response.status_code != 200 or "choices" not in raw:
+        logger.error(
+            f"[ai_analyst] OpenRouter resposta inesperada "
+            f"(status={response.status_code}): {json.dumps(raw)[:500]}"
+        )
+        raise RuntimeError(
+            f"OpenRouter retornou {response.status_code} sem 'choices': "
+            f"{json.dumps(raw)[:300]}"
+        )
+
+    return raw["choices"][0]["message"]["content"]
 
 
 def call_ollama(system_prompt: str, data_context: str, model: str) -> str:
@@ -697,18 +796,84 @@ def call_ollama(system_prompt: str, data_context: str, model: str) -> str:
 
 
 def call_model(system_prompt: str, data_context: str) -> str:
-    provider = os.getenv("AI_PROVIDER", "groq").lower().strip()
+    provider = _get_provider()
     model    = os.getenv("AI_MODEL", "llama-3.3-70b-versatile").strip()
     fallback = os.getenv("OLLAMA_FALLBACK_MODEL", "").strip()
 
     logger.info(f"[ai_analyst] Provider: {provider} | Modelo: {model}")
 
-    if (
-        provider in ("groq", "openrouter")
-        and len(data_context) > _COMPRESSION_THRESHOLD
-    ):
-        data_context = _compress_context_ollama(data_context)
+    if provider == "groq":
+        _C2T               = _GROQ_CHARS_PER_TOKEN
+        input_token_budget = _GROQ_FREE_TPM - _GROQ_MAX_OUTPUT_TOKENS
 
+        system_tokens      = int(len(system_prompt) / _C2T)
+        data_budget_tokens = input_token_budget - system_tokens
+        data_budget_chars  = int(max(0, data_budget_tokens) * _C2T)
+
+        logger.info(
+            f"[ai_analyst] System prompt: {system_tokens} tokens | "
+            f"Budget para dados: {data_budget_tokens} tokens ({data_budget_chars} chars)"
+        )
+
+        if data_budget_tokens < 500:
+            max_system_chars = int((input_token_budget - 500) * _C2T)
+            logger.critical(
+                f"[ai_analyst] Skills muito grandes ({system_tokens} tokens) — "
+                f"excedem o budget de {input_token_budget} tokens. "
+                f"Truncando system_prompt para {max_system_chars} chars. "
+                f"AÇÃO NECESSÁRIA: reduza os arquivos .md em core/skills/."
+            )
+            system_prompt      = system_prompt[:max_system_chars] + "\n...[skills truncadas — arquivos .md muito grandes]"
+            system_tokens      = int(len(system_prompt) / _C2T)
+            data_budget_tokens = input_token_budget - system_tokens
+            data_budget_chars  = int(data_budget_tokens * _C2T)
+
+        if len(data_context) > _COMPRESSION_THRESHOLD:
+            logger.info(f"[ai_analyst] Comprimindo contexto via Ollama (Groq budget)...")
+            data_context = _compress_context_ollama(data_context)
+
+        if len(data_context) > data_budget_chars:
+            logger.warning(
+                f"[ai_analyst] Truncando data_context: "
+                f"{len(data_context)} → {data_budget_chars} chars "
+                f"(budget real para dados: {data_budget_tokens} tokens)."
+            )
+            data_context = (
+                data_context[:data_budget_chars]
+                + "\n...[truncado por orçamento de tokens do provider]"
+            )
+
+        estimated = _estimate_tokens(system_prompt, data_context)
+        logger.info(
+            f"[ai_analyst] Total estimado final: {estimated} tokens | Budget: {input_token_budget}"
+        )
+
+    elif provider == "openrouter":
+        context_len = len(system_prompt) + len(data_context)
+        logger.info(
+            f"[ai_analyst] OpenRouter — contexto total: {context_len} chars "
+            f"({int(context_len / _GROQ_CHARS_PER_TOKEN):,} tokens estimados) | "
+            f"Limite do modelo: 262K tokens"
+        )
+        if len(data_context) > _OPENROUTER_MAX_CONTEXT_CHARS:
+            logger.warning(
+                f"[ai_analyst] data_context excede safety net OpenRouter "
+                f"({len(data_context)} > {_OPENROUTER_MAX_CONTEXT_CHARS} chars). Truncando."
+            )
+            data_context = (
+                data_context[:_OPENROUTER_MAX_CONTEXT_CHARS]
+                + "\n...[truncado por safety net — contexto excepcionalmente grande]"
+            )
+
+    elif provider == "ollama":
+        if len(data_context) > _OLLAMA_MAX_CONTEXT_CHARS:
+            logger.warning(
+                f"[ai_analyst] Safety net Ollama: "
+                f"{len(data_context)} → {_OLLAMA_MAX_CONTEXT_CHARS} chars"
+            )
+            data_context = data_context[:_OLLAMA_MAX_CONTEXT_CHARS] + "\n...[truncado]"
+
+    # ── Roteamento de provider ────────────────────────────────────────────
     if provider == "groq":
         try:
             return call_groq(system_prompt, data_context, model)
@@ -800,18 +965,9 @@ def save_analysis(target: str, analysis: dict) -> str:
     return str(filename)
 
 
-
 # ── Conversores determinísticos ──────────────────────────────────────────
-#
-# Transformam outputs de agentes upstream em findings do schema Finding
-# SEM passar pelo LLM. O modelo analisa apenas o que esses conversores
-# não cobrem (infraestrutura, CVEs, portas).
 
 def _convert_header_findings(header_data: dict) -> list[dict]:
-    """
-    Converte findings do header_agent para o schema Finding.
-    Agrupa por tema (5 grupos máximo) para não inflar o output.
-    """
     if not header_data or header_data.get("error"):
         return []
     raw_findings: list[dict] = header_data.get("findings", [])
@@ -821,7 +977,6 @@ def _convert_header_findings(header_data: dict) -> list[dict]:
     converted: list[dict] = []
     f_id = 1
 
-    # Grupo 1: HTTPS/HSTS
     tls_group = [f for f in raw_findings if f.get("type") in ("no_ssl", "missing_strict_transport_security")]
     if tls_group:
         evidences = [f.get("evidence", "") for f in tls_group if f.get("evidence")]
@@ -838,7 +993,6 @@ def _convert_header_findings(header_data: dict) -> list[dict]:
         })
         f_id += 1
 
-    # Grupo 2: Headers de protecao (CSP, XFO, Permissions)
     protection_types = {"missing_content_security_policy", "missing_x_frame_options", "missing_permissions_policy", "missing_x_content_type_options", "missing_referrer_policy"}
     protection_group = [f for f in raw_findings if f.get("type") in protection_types]
     if protection_group:
@@ -856,7 +1010,6 @@ def _convert_header_findings(header_data: dict) -> list[dict]:
         })
         f_id += 1
 
-    # Grupo 3: Info leakage
     leakage_group = [f for f in raw_findings if f.get("type", "").startswith("info_leak_")]
     if leakage_group:
         evidences = [f.get("evidence", "") for f in leakage_group if f.get("evidence")]
@@ -873,7 +1026,6 @@ def _convert_header_findings(header_data: dict) -> list[dict]:
         })
         f_id += 1
 
-    # Grupo 4: Cookie flags
     cookie_types = {"cookie_no_secure", "cookie_no_httponly", "cookie_no_samesite"}
     cookie_group = [f for f in raw_findings if f.get("type") in cookie_types]
     if cookie_group:
@@ -894,7 +1046,6 @@ def _convert_header_findings(header_data: dict) -> list[dict]:
         })
         f_id += 1
 
-    # Grupo 5: CORS wildcard
     cors_finding = next((f for f in raw_findings if f.get("type") == "cors_wildcard"), None)
     if cors_finding:
         converted.append({
@@ -906,7 +1057,7 @@ def _convert_header_findings(header_data: dict) -> list[dict]:
             "evidence": cors_finding.get("evidence", ""),
             "exploitation": {"complexity": "BAIXA", "realistic_scenario": "1. Vitima acessa site malicioso autenticada na aplicacao alvo. 2. Script executa: fetch('https://alvo/api/user', {credentials:'include'}). 3. CORS wildcard permite leitura da resposta com dados do perfil. 4. Dados exfiltrados para C2."},
             "recommendation": {"priority": "MEDIUM", "action": "Restringir: Access-Control-Allow-Origin: https://seudominio.com", "verification": "curl -H 'Origin: https://evil.com' -I http://alvo/api | grep -i access-control"},
-            "_source": "header_agent",
+            "_source": "subdomain_agent",
         })
         f_id += 1
 
@@ -915,7 +1066,6 @@ def _convert_header_findings(header_data: dict) -> list[dict]:
 
 
 def _convert_subdomain_findings(subdomain_data: dict) -> list[dict]:
-    """Converte takeover candidates em findings CRITICAL determinísticos."""
     if not subdomain_data or subdomain_data.get("error"):
         return []
     candidates = subdomain_data.get("takeover_candidates", [])
@@ -939,11 +1089,6 @@ def _convert_subdomain_findings(subdomain_data: dict) -> list[dict]:
 
 
 def _merge_findings(llm_findings: list[dict], confirmed_findings: list[dict]) -> list[dict]:
-    """
-    Merge findings LLM + findings confirmados dos agentes.
-    Findings confirmados tem prioridade. Deduplica por mitre_id + category.
-    Ordena: CRITICAL -> HIGH -> MEDIUM -> LOW -> INFO
-    """
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     confirmed_keys: set[str] = set()
     for f in confirmed_findings:
@@ -962,6 +1107,7 @@ def _merge_findings(llm_findings: list[dict], confirmed_findings: list[dict]) ->
     )
     return merged
 
+
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def run(
@@ -970,20 +1116,9 @@ def run(
     shodan_data     : Optional[dict] = None,
     correlator_data : Optional[dict] = None,
     enrichment_data : Optional[dict] = None,
-    subdomain_data  : Optional[dict] = None,   # ← subdomain_agent
-    header_data     : Optional[dict] = None,   # ← header_agent
+    subdomain_data  : Optional[dict] = None,
+    header_data     : Optional[dict] = None,
 ) -> dict:
-    """
-    Args:
-        collected_data  → collector  (WHOIS, DNS)                        [obrigatório]
-        validation      → validator  (score, checks)                     [opcional]
-        shodan_data     → infra_agent (portas, serviços)                 [opcional]
-        correlator_data → correlator  (pares, scores)                    [opcional]
-        enrichment_data → enrichment_agent (subdomínios, CVEs, HTTP,
-                          reputação, SSL)                                [opcional]
-        subdomain_data  → subdomain_agent (crt.sh + DNS + takeover)     [opcional]
-        header_data     → header_agent (headers HTTP + cookies + CORS)  [opcional]
-    """
     is_ip  = collected_data.get("is_ip", False)
     target = collected_data.get("ip") if is_ip else collected_data.get("domain", "desconhecido")
     if not target:
@@ -991,6 +1126,7 @@ def run(
 
     logger.info(f"[ai_analyst] Iniciando análise para: {target}")
 
+    provider      = _get_provider()
     skills        = load_skills()
     memory        = load_memory()
     system_prompt = build_system_prompt(skills, format_memory(memory))
@@ -1021,32 +1157,57 @@ def run(
         ]
 
     if enrichment_data and "error" not in enrichment_data:
-        context_parts += _build_enrichment_block(enrichment_data)
+        context_parts += _build_enrichment_block(enrichment_data, provider=provider)
 
-    # blocos dos novos agentes
     if subdomain_data and not subdomain_data.get("error"):
         context_parts += _build_subdomain_block(subdomain_data)
 
     if header_data and not header_data.get("error"):
         context_parts += _build_header_block(header_data)
 
-    # instrução final — agora ciente dos novos agentes
     context_parts.append(
         _build_analysis_instruction(enrichment_data, subdomain_data, header_data)
     )
 
     data_context = "\n".join(context_parts)
 
-    if len(data_context) > _MAX_CONTEXT_CHARS:
-        original_len = len(data_context)
-        data_context = data_context[:_MAX_CONTEXT_CHARS] + \
-                       "\n...[contexto truncado — limite atingido]"
-        logger.warning(
-            f"[ai_analyst] Contexto truncado no safety net: "
-            f"{original_len} → {_MAX_CONTEXT_CHARS} chars"
-        )
+    # ── Pre-truncamento por provider ──────────────────────────────────────
+    if provider == "groq":
+        _C2T_PRE          = _GROQ_CHARS_PER_TOKEN
+        _system_tok       = int(len(system_prompt) / _C2T_PRE)
+        _input_budget_pre = _GROQ_FREE_TPM - _GROQ_MAX_OUTPUT_TOKENS
+        _data_budget_pre  = max(500, _input_budget_pre - _system_tok)
+        _data_chars_pre   = int(_data_budget_pre * _C2T_PRE)
 
-    logger.debug(f"[ai_analyst] Tamanho do contexto: {len(data_context)} chars")
+        if len(data_context) > _data_chars_pre:
+            _orig = len(data_context)
+            data_context = data_context[:_data_chars_pre] + "\n...[contexto truncado — limite de tokens]"
+            logger.warning(
+                f"[ai_analyst] Pre-truncamento Groq (system={_system_tok} tok, "
+                f"data_budget={_data_budget_pre} tok): {_orig} → {_data_chars_pre} chars"
+            )
+
+    elif provider == "openrouter":
+        total_chars = len(system_prompt) + len(data_context)
+        total_tokens_est = int(total_chars / _GROQ_CHARS_PER_TOKEN)
+        logger.info(
+            f"[ai_analyst] OpenRouter — contexto total: {total_chars:,} chars "
+            f"(~{total_tokens_est:,} tokens) | Limite Nemotron: 262K tokens"
+        )
+        if len(data_context) > _OPENROUTER_MAX_CONTEXT_CHARS:
+            _orig = len(data_context)
+            data_context = data_context[:_OPENROUTER_MAX_CONTEXT_CHARS] + "\n...[truncado — safety net]"
+            logger.warning(
+                f"[ai_analyst] Safety net OpenRouter: {_orig} → {_OPENROUTER_MAX_CONTEXT_CHARS} chars"
+            )
+
+    else:
+        if len(data_context) > _OLLAMA_MAX_CONTEXT_CHARS:
+            _orig = len(data_context)
+            data_context = data_context[:_OLLAMA_MAX_CONTEXT_CHARS] + "\n...[contexto truncado — limite atingido]"
+            logger.warning(f"[ai_analyst] Safety net Ollama: {_orig} → {_OLLAMA_MAX_CONTEXT_CHARS} chars")
+
+    logger.debug(f"[ai_analyst] Tamanho do contexto (data): {len(data_context)} chars")
 
     try:
         raw_response = call_model(system_prompt, data_context)
@@ -1056,7 +1217,7 @@ def run(
         analysis.update({
             "target"     : target,
             "analyzed_at": datetime.now().isoformat(),
-            "provider"   : os.getenv("AI_PROVIDER", "groq"),
+            "provider"   : provider,
             "model"      : os.getenv("AI_MODEL", "llama-3.3-70b-versatile"),
         })
         analysis["saved_to"] = save_analysis(target, analysis)
@@ -1064,19 +1225,18 @@ def run(
 
     analysis = parse_response(raw_response)
 
-    # ── Merge determinístico: findings confirmados + LLM ─────────────────
-    # Converte findings dos agentes upstream para o schema Finding.
-    # O LLM pode ter gerado findings de headers/subdomains — o merge
-    # descarta sobreposições e mantém os confirmados com prioridade.
-    confirmed_findings = _convert_header_findings(header_data) +                          _convert_subdomain_findings(subdomain_data)
+    confirmed_findings = (
+        _convert_header_findings(header_data)
+        + _convert_subdomain_findings(subdomain_data)
+    )
     if confirmed_findings:
-        llm_findings   = analysis.get("findings", [])
+        llm_findings         = analysis.get("findings", [])
         analysis["findings"] = _merge_findings(llm_findings, confirmed_findings)
 
     analysis.update({
         "target"     : target,
         "analyzed_at": datetime.now().isoformat(),
-        "provider"   : os.getenv("AI_PROVIDER", "groq"),
+        "provider"   : provider,
         "model"      : os.getenv("AI_MODEL", "llama-3.3-70b-versatile"),
     })
     analysis["saved_to"] = save_analysis(target, analysis)

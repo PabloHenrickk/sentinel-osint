@@ -133,7 +133,7 @@ def _count_by_severity(findings: list) -> dict:
 
 
 def _risk_level(analysis: dict) -> str:
-    exec_s = analysis.get("executive_summary", {})
+    exec_s = analysis.get("executive_summary") or {}
     if isinstance(exec_s, dict):
         return (exec_s.get("risk_level") or analysis.get("priority_level") or "INDETERMINADO").upper()
     return (analysis.get("priority_level") or "INDETERMINADO").upper()
@@ -151,7 +151,7 @@ def _section_cover(analysis: dict, target: str) -> str:
     analyzed = analysis.get("analyzed_at", datetime.now().isoformat())[:19].replace("T", " ")
     provider = analysis.get("provider", "—")
     model    = analysis.get("model", "—")
-    findings = analysis.get("findings", [])
+    findings = analysis.get("findings") or []
     counts   = _count_by_severity(findings)
 
     return f"""# SENTINEL OSINT — Relatório de Inteligência
@@ -180,17 +180,17 @@ def _section_cover(analysis: dict, target: str) -> str:
 
 
 def _section_executive_summary(analysis: dict) -> str:
-    exec_s = analysis.get("executive_summary", {})
+    exec_s = analysis.get("executive_summary") or {}
     risk   = _risk_level(analysis)
     emoji  = _emoji(risk)
 
     if isinstance(exec_s, dict):
         justification = exec_s.get("risk_justification", "")
-        actions       = exec_s.get("immediate_actions_required", [])
-        vectors       = exec_s.get("key_attack_vectors", [])
+        actions       = exec_s.get("immediate_actions_required") or []
+        vectors       = exec_s.get("key_attack_vectors") or []
     else:
         justification = str(exec_s) if exec_s else ""
-        actions       = analysis.get("recommendations", [])
+        actions       = analysis.get("recommendations") or []
         vectors       = []
 
     lines = [
@@ -203,7 +203,6 @@ def _section_executive_summary(analysis: dict) -> str:
     if justification:
         lines += [justification, ""]
 
-    # Ações imediatas
     if actions:
         lines.append("### Ações Imediatas Requeridas")
         lines.append("")
@@ -211,7 +210,6 @@ def _section_executive_summary(analysis: dict) -> str:
             lines.append(f"{i}. {action}")
         lines.append("")
 
-    # Vetores principais
     if vectors:
         lines.append("### Vetores de Ataque Identificados")
         lines.append("")
@@ -219,10 +217,9 @@ def _section_executive_summary(analysis: dict) -> str:
             lines.append(f"- {v}")
         lines.append("")
 
-    # Se não veio do LLM, gera a partir dos findings
-    findings = analysis.get("findings", [])
+    findings = analysis.get("findings") or []
     if not justification and findings:
-        counts  = _count_by_severity(findings)
+        counts    = _count_by_severity(findings)
         criticals = [f for f in findings if _sev(f) == "CRITICAL"]
         highs     = [f for f in findings if _sev(f) == "HIGH"]
 
@@ -264,11 +261,10 @@ def _section_threat_profile(analysis: dict) -> str:
     lines.append(f"| Superfície de ataque | {surface} |")
     lines.append("")
 
-    # Se o threat_profile está vazio, gera inferência dos findings
     if not tp:
-        findings  = analysis.get("findings", [])
+        findings  = analysis.get("findings") or []
         criticals = [f for f in findings if _sev(f) == "CRITICAL"]
-        lines.pop()  # remove linha vazia
+        lines.pop()
         lines = lines[:1] + [
             "",
             "> Perfil inferido a partir dos achados identificados.",
@@ -290,21 +286,15 @@ def _section_threat_profile(analysis: dict) -> str:
 
 
 def _section_attack_surface(analysis: dict, raw_data: dict) -> str:
-    """
-    Constrói seção de superfície de ataque a partir dos dados brutos
-    e dos findings. Inclui portas, serviços, headers e reputação.
-    """
-    findings = analysis.get("findings", [])
+    findings = analysis.get("findings") or []
     lines    = [
         "## 03. Superfície de Ataque",
         "",
     ]
 
-    # Infraestrutura — extrai do campo infrastructure_intelligence se disponível
     infra = analysis.get("infrastructure_intelligence") or {}
-    ports = infra.get("open_ports", [])
+    ports = infra.get("open_ports") or []
 
-    # Fallback: extrai portas dos findings se infrastructure_intelligence vazio
     if not ports:
         port_findings = [f for f in findings if "porta" in f.get("title", "").lower()
                          or "port" in f.get("title", "").lower()
@@ -321,7 +311,6 @@ def _section_attack_surface(analysis: dict, raw_data: dict) -> str:
                 lines.append(f"- {p}")
         lines.append("")
 
-    # Headers
     header_findings = [f for f in findings if f.get("category") in
                        ("Transport Security", "Security Headers", "Information Disclosure",
                         "Session Security", "API Security")]
@@ -336,7 +325,6 @@ def _section_attack_surface(analysis: dict, raw_data: dict) -> str:
             lines.append(f"| {f.get('category', '—')} | {emoji} {_sev_pt(sev)} | {title} |")
         lines.append("")
 
-    # Reputação
     rep = analysis.get("reputation_analysis") or {}
     if rep:
         lines += ["### Reputação e Inteligência de Ameaças", ""]
@@ -349,7 +337,7 @@ def _section_attack_surface(analysis: dict, raw_data: dict) -> str:
 
 
 def _section_findings(analysis: dict) -> str:
-    findings = _sorted_findings(analysis.get("findings", []))
+    findings = _sorted_findings(analysis.get("findings") or [])
 
     lines = [
         "## 04. Findings Detalhados",
@@ -366,8 +354,8 @@ def _section_findings(analysis: dict) -> str:
         mname    = _mitre_name(f)
         murl     = _mitre_url(mid)
         prazo    = _prazo(sev)
-        desc     = f.get("description", "")
-        evidence = f.get("evidence", "")
+        desc     = f.get("description") or ""
+        evidence = f.get("evidence") or ""
         source   = f.get("_source", "")
 
         lines += [
@@ -375,7 +363,6 @@ def _section_findings(analysis: dict) -> str:
             "",
         ]
 
-        # Tabela de metadados
         mitre_cell = f"[{mid}]({murl}) — {mname}" if murl else f"{mid} — {mname}"
         lines += [
             "| Campo | Detalhe |",
@@ -396,15 +383,12 @@ def _section_findings(analysis: dict) -> str:
 
         lines.append("")
 
-        # Descrição
         if desc:
             lines += ["**Descrição**", "", desc, ""]
 
-        # Evidência
         if evidence:
             lines += ["**Evidência**", "", f"```", evidence, "```", ""]
 
-        # Detalhe técnico
         tech = f.get("technical_detail") or {}
         if isinstance(tech, dict) and any(tech.values()):
             lines += ["**Detalhe Técnico**", ""]
@@ -414,7 +398,6 @@ def _section_findings(analysis: dict) -> str:
                 lines.append(f"- **Evidência adicional:** {tech['evidence']}")
             lines.append("")
 
-        # Impacto adversarial
         impact = f.get("adversarial_impact") or {}
         if isinstance(impact, dict) and any(impact.values()):
             lines += ["**Impacto Adversarial**", ""]
@@ -423,12 +406,11 @@ def _section_findings(analysis: dict) -> str:
             if impact.get("data_at_risk"):   lines.append(f"- **Dados em risco:** {impact['data_at_risk']}")
             lines.append("")
 
-        # Kill chain / cenário realista
         exploit = f.get("exploitation") or {}
         if isinstance(exploit, dict):
             complexity = exploit.get("complexity", "")
             scenario   = exploit.get("realistic_scenario", "")
-            prereqs    = exploit.get("prerequisites", [])
+            prereqs    = exploit.get("prerequisites") or []
 
             if complexity or scenario:
                 lines += ["**Cenário de Exploração**", ""]
@@ -438,7 +420,6 @@ def _section_findings(analysis: dict) -> str:
                     lines.append(f"- **Pré-requisitos:** {', '.join(prereqs)}")
                 if scenario:
                     lines.append("")
-                    # Formata o cenário como lista numerada se vier como string
                     steps = [s.strip() for s in scenario.split(". ") if s.strip()]
                     if len(steps) > 1:
                         for step in steps:
@@ -449,7 +430,6 @@ def _section_findings(analysis: dict) -> str:
                         lines.append(f"> {scenario}")
                 lines.append("")
 
-        # Recomendação
         rec = f.get("recommendation") or {}
         if isinstance(rec, dict) and any(rec.values()):
             lines += ["**Remediação**", ""]
@@ -471,12 +451,7 @@ def _section_findings(analysis: dict) -> str:
 
 
 def _section_attack_narrative(analysis: dict, target: str) -> str:
-    """
-    Narrativa de ataque — conta a história de como um adversário
-    usaria os dados encontrados, do reconhecimento ao objetivo.
-    Construída deterministicamente a partir dos findings, não do LLM.
-    """
-    findings  = _sorted_findings(analysis.get("findings", []))
+    findings  = _sorted_findings(analysis.get("findings") or [])
     criticals = [f for f in findings if _sev(f) == "CRITICAL"]
     highs     = [f for f in findings if _sev(f) == "HIGH"]
     mediums   = [f for f in findings if _sev(f) == "MEDIUM"]
@@ -495,7 +470,6 @@ def _section_attack_narrative(analysis: dict, target: str) -> str:
         "",
     ]
 
-    # Lista os dados coletados
     infra_findings = [f for f in findings if f.get("category") in
                       ("Remote Access", "Database", "Backdoor", "Non-Standard Port")]
     if infra_findings:
@@ -524,7 +498,7 @@ def _section_attack_narrative(analysis: dict, target: str) -> str:
         )
         lines.append("")
 
-        exploit = criticals[0].get("exploitation") or {}
+        exploit  = criticals[0].get("exploitation") or {}
         scenario = exploit.get("realistic_scenario", "")
         if scenario:
             lines.append("O caminho de exploração mais direto:")
@@ -546,7 +520,7 @@ def _section_attack_narrative(analysis: dict, target: str) -> str:
         )
         lines.append("")
         for f in highs[:3]:
-            lines.append(f"- **{f.get('title', '—')}:** {f.get('description', '')[:120]}...")
+            lines.append(f"- **{f.get('title') or '—'}:** {(f.get('description') or '')[:120]}...")
         lines.append("")
 
     if mediums:
@@ -566,7 +540,7 @@ def _section_attack_narrative(analysis: dict, target: str) -> str:
 
 
 def _section_hypotheses(analysis: dict) -> str:
-    hypotheses = analysis.get("attack_hypotheses", [])
+    hypotheses = analysis.get("attack_hypotheses") or []
 
     lines = [
         "## 06. Hipóteses Adversariais",
@@ -581,15 +555,15 @@ def _section_hypotheses(analysis: dict) -> str:
         if not isinstance(h, dict):
             continue
 
-        name     = h.get("name", f"Hipótese {idx}")
-        actor    = h.get("threat_actor_profile", "—")
-        objective= h.get("objective", "—")
-        prob     = PROBABILITY_PT.get(h.get("probability", "").upper(), h.get("probability", "—"))
-        prob_just= h.get("probability_justification", "")
-        prereqs  = h.get("prerequisites", [])
-        impact   = h.get("potential_impact", "")
-        detection= h.get("detection_indicators", [])
-        kill     = h.get("kill_chain", [])
+        name      = h.get("name", f"Hipótese {idx}")
+        actor     = h.get("threat_actor_profile", "—")
+        objective = h.get("objective", "—")
+        prob      = PROBABILITY_PT.get(h.get("probability", "").upper(), h.get("probability", "—"))
+        prob_just = h.get("probability_justification", "")
+        prereqs   = h.get("prerequisites") or []
+        impact    = h.get("potential_impact", "")
+        detection = h.get("detection_indicators") or []
+        kill      = h.get("kill_chain") or []
 
         prob_emoji = {"ALTA": "🔴", "MÉDIA": "🟡", "BAIXA": "🔵"}.get(prob, "⚪")
 
@@ -649,7 +623,7 @@ def _section_hypotheses(analysis: dict) -> str:
 
 
 def _section_blind_spots(analysis: dict) -> str:
-    blind_spots = analysis.get("blind_spots", [])
+    blind_spots = analysis.get("blind_spots") or []
 
     lines = [
         "## 07. Pontos Cegos da Análise",
@@ -675,10 +649,10 @@ def _section_blind_spots(analysis: dict) -> str:
         ]
         for bs in blind_spots:
             if isinstance(bs, dict):
-                area    = bs.get("area", "—")
-                reason  = bs.get("reason", "—")
-                impact  = bs.get("impact_on_analysis", "—")
-                method  = bs.get("collection_method", "—")
+                area   = bs.get("area", "—")
+                reason = bs.get("reason", "—")
+                impact = bs.get("impact_on_analysis", "—")
+                method = bs.get("collection_method", "—")
                 lines.append(f"| {area} | {reason} | {impact} | {method} |")
         lines.append("")
 
@@ -687,13 +661,9 @@ def _section_blind_spots(analysis: dict) -> str:
 
 
 def _section_remediation_roadmap(analysis: dict) -> str:
-    """
-    Roadmap de remediação priorizado por risco.
-    Construído a partir dos findings + recomendações do LLM.
-    """
-    findings = _sorted_findings(analysis.get("findings", []))
-    recs_llm = analysis.get("prioritized_recommendations", []) or \
-               analysis.get("recommendations", [])
+    findings = _sorted_findings(analysis.get("findings") or [])
+    recs_llm = analysis.get("prioritized_recommendations") or \
+               analysis.get("recommendations") or []
 
     lines = [
         "## 08. Roadmap de Remediação",
@@ -716,13 +686,11 @@ def _section_remediation_roadmap(analysis: dict) -> str:
             action = rec.get("action", "—")
         elif isinstance(rec, str):
             action = rec
-        # Trunca para caber na tabela
         action_short = action[:80] + "..." if len(action) > 80 else action
         lines.append(f"| {idx} | {emoji} {_sev_pt(sev)} | {title} | {prazo} | {action_short} |")
 
     lines.append("")
 
-    # Detalhamento das verificações para CRITICAL e HIGH
     critical_high = [f for f in findings if _sev(f) in ("CRITICAL", "HIGH")]
     if critical_high:
         lines += [
@@ -738,7 +706,6 @@ def _section_remediation_roadmap(analysis: dict) -> str:
                 lines.append(f"```")
                 lines.append("")
 
-    # Recomendações adicionais do LLM (sem duplicar os findings)
     if recs_llm:
         lines += ["### Recomendações Adicionais", ""]
         for r in recs_llm[:10]:
@@ -771,7 +738,6 @@ def _section_appendix(analysis: dict, target: str) -> str:
         "",
     ]
 
-    # Confidence assessment
     conf = analysis.get("confidence_assessment") or {}
     if isinstance(conf, dict) and conf:
         lines += ["### Avaliação de Confiança", ""]
@@ -779,8 +745,7 @@ def _section_appendix(analysis: dict, target: str) -> str:
             lines.append(f"- **{k}:** {v}")
         lines.append("")
 
-    # Validation warnings do Pydantic
-    warnings = analysis.get("_validation_warnings", [])
+    warnings = analysis.get("_validation_warnings") or []
     if warnings:
         lines += [
             "### Avisos de Validação do Schema",
@@ -855,7 +820,6 @@ def run(
 
     report_md = "\n\n".join(sections)
 
-    # Salva o arquivo
     if output_path:
         path = Path(output_path)
     else:
@@ -912,7 +876,7 @@ Exemplos:
     print(f"{'='*60}")
     print(f"Relatório gerado: {report_path}")
 
-    findings = analysis.get("findings", [])
+    findings = analysis.get("findings") or []
     counts   = _count_by_severity(findings)
     print(f"\nAchados: {len(findings)} total")
     for sev, count in counts.items():
