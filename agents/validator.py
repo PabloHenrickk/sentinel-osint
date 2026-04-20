@@ -125,14 +125,13 @@ def run(collected_data: dict) -> dict:
     """
     Valida dados do collector e atribui score de confiança.
 
-    Lê o flag `is_ip` do collector para aplicar critérios corretos.
-    O campo `target` no output contém domínio ou IP — nunca mistura os dois.
+    SEPARAÇÃO DE RESPONSABILIDADES:
+      - integrity_ok: dados mínimos para análise (DNS resolveu → tem IP)
+      - confidence_score: qualidade dos dados (WHOIS completo, PTR, etc.)
+      - approved: True se integrity_ok — score baixo é aviso, nunca bloqueio
 
-    Args:
-        collected_data: dict retornado por collector.run().
-
-    Returns:
-        dict com score, status de aprovação e breakdown por checagem.
+    Domínios .com.br têm WHOIS reduzido por política do Registro.br.
+    Isso não é fraqueza do alvo — é limitação da fonte. Não deve bloquear.
     """
     is_ip: bool = collected_data.get("is_ip", False)
     target: str = collected_data.get("ip") if is_ip else collected_data.get("domain", "")
@@ -143,8 +142,8 @@ def run(collected_data: dict) -> dict:
 
     if is_ip:
         checks = {
-            "domain_format": {"valid": True,  "score": 0, "reason": "N/A para IPs"},
-            "whois":         {"valid": True,  "score": 0, "reason": "N/A para IPs"},
+            "domain_format": {"valid": True, "score": 0, "reason": "N/A para IPs"},
+            "whois":         {"valid": True, "score": 0, "reason": "N/A para IPs"},
             "dns":           validate_dns_ip(dns_data),
         }
     else:
@@ -155,17 +154,40 @@ def run(collected_data: dict) -> dict:
         }
 
     confidence = calculate_confidence(checks, is_ip)
-    approved = confidence >= APPROVAL_THRESHOLD
+
+    # Pipeline para APENAS se não há IPs — análise impossível sem alvo resolvido
+    integrity_ok: bool = checks["dns"]["valid"]
+    approved: bool = integrity_ok
+
+    # Warnings alimentam o ai_analyst como contexto, não bloqueiam
+    warnings: list[str] = []
+    if not is_ip and not checks["whois"]["valid"]:
+        warnings.append(
+            f"WHOIS parcial: {checks['whois'].get('reason', 'dados incompletos')} "
+            f"— comum em domínios .com.br (Registro.br restringe dados públicos)"
+        )
+    if confidence < APPROVAL_THRESHOLD and approved:
+        warnings.append(
+            f"Score de qualidade {confidence}/100 — dados incompletos mas análise prossegue"
+        )
 
     validation = {
-        "target":           target,           # domínio ou IP — nunca mistura
-        "is_ip":            is_ip,            # propaga flag para agentes downstream
+        "target":           target,
+        "is_ip":            is_ip,
         "target_type":      "ip" if is_ip else "domain",
         "confidence_score": confidence,
+        "integrity_ok":     integrity_ok,
         "approved":         approved,
         "checks":           checks,
+        "warnings":         warnings,
     }
 
-    status = "APROVADO" if approved else "REPROVADO"
-    print(f"[validator] {status} — confiança: {confidence}/100")
+    if approved:
+        qualifier = "" if confidence >= APPROVAL_THRESHOLD else " COM RESSALVAS"
+        print(f"[validator] APROVADO{qualifier} — confiança: {confidence}/100")
+        for w in warnings:
+            print(f"[validator] ⚠  {w}")
+    else:
+        print(f"[validator] REPROVADO — DNS não resolveu, análise impossível")
+
     return validation

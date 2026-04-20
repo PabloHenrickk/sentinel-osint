@@ -600,6 +600,13 @@ def _build_analysis_instruction(
         "  Headers criticos ausentes (CSP, XFO, Permissions) -> MEDIUM | T1185",
         "  Info leakage (Server, X-Powered-By) -> LOW  | T1592.002",
         "  Cookies sem flags (Secure, HttpOnly) -> MEDIUM | T1185",
+        "  TXT Intelligence (serviços detectados) -> finding MEDIUM por categoria de risco:",
+        "  CRM (Salesforce, HubSpot)            -> T1598 — Phishing for Information",
+        "  IdP/SSO (Okta, Duo)                  -> T1556 — Modify Auth Process",
+        "  Monitoramento (Dynatrace, Datadog)   -> T1195 — Supply Chain Compromise",
+        "   PF +all ou sem DMARC                -> T1566 — Phishing",
+        "OBRIGATÓRIO: severity SEMPRE em inglês: CRITICAL | HIGH | MEDIUM | LOW | INFO",
+        "PROIBIDO: CRÍTICO, ALTO, MÉDIO, BAIXO — o schema rejeita português.",
     ]
 
     if header_finding_count > 0:
@@ -827,10 +834,6 @@ def call_model(system_prompt: str, data_context: str) -> str:
             system_tokens      = int(len(system_prompt) / _C2T)
             data_budget_tokens = input_token_budget - system_tokens
             data_budget_chars  = int(data_budget_tokens * _C2T)
-
-        if len(data_context) > _COMPRESSION_THRESHOLD:
-            logger.info(f"[ai_analyst] Comprimindo contexto via Ollama (Groq budget)...")
-            data_context = _compress_context_ollama(data_context)
 
         if len(data_context) > data_budget_chars:
             logger.warning(
@@ -1118,6 +1121,7 @@ def run(
     enrichment_data : Optional[dict] = None,
     subdomain_data  : Optional[dict] = None,
     header_data     : Optional[dict] = None,
+    txt_intel       : Optional[dict] = None,
 ) -> dict:
     is_ip  = collected_data.get("is_ip", False)
     target = collected_data.get("ip") if is_ip else collected_data.get("domain", "desconhecido")
@@ -1143,6 +1147,12 @@ def run(
             "", "## VALIDAÇÃO",
             json.dumps(validation, indent=2, ensure_ascii=False),
         ]
+    if txt_intel and txt_intel.get("total_services", 0) > 0:
+        context_parts += [
+            "",
+            "## TECNOLOGIA DETECTADA VIA DNS TXT (superfície de ataque)",
+            json.dumps(txt_intel, indent=2, ensure_ascii=False),
+    ]
 
     if shodan_data and "error" not in shodan_data:
         context_parts += [
