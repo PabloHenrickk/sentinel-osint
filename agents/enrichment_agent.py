@@ -585,15 +585,26 @@ def run(
 
     # subdomínios e SSL — apenas domínios
     if not is_ip:
-        result["sources"]["subdomains"] = fetch_subdomains(target)
-        result["sources"]["ssl"]        = fetch_ssl_info(target)
-        result["sources"]["http"]       = fetch_http_fingerprint(target)
+        for fetch_fn, key, fallback in [
+            (lambda: fetch_subdomains(target), "subdomains", {"subdomains": [], "count": 0}),
+            (lambda: fetch_ssl_info(target),   "ssl",        {}),
+            (lambda: fetch_http_fingerprint(target), "http", {}),
+        ]:
+            try:
+                result["sources"][key] = fetch_fn()
+            except Exception as e:
+                logger.warning(f"[enrichment] {key} falhou inesperadamente: {e}")
+                result["sources"][key] = {**fallback, "error": str(e)}
     else:
         for key in ("subdomains", "ssl", "http"):
             result["sources"][key] = {"skipped": True, "reason": "Alvo é IP"}
 
     # VirusTotal — domínio ou IP
-    result["sources"]["virustotal"] = fetch_virustotal(target)
+    try:
+        result["sources"]["virustotal"] = fetch_virustotal(target)
+    except Exception as e:
+        logger.warning(f"[enrichment] virustotal falhou inesperadamente: {e}")
+        result["sources"]["virustotal"] = {"error": str(e)}
 
     # por IP: Shodan full, AbuseIPDB, IPInfo
     shodan_results:    list[dict] = []

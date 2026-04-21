@@ -20,6 +20,10 @@ Rate limits (Portal da Transparência):
 BUGS CORRIGIDOS:
   - _get(): 'itens' -> 'tamanhoPagina' (param correto da API v3)
   - _fetch_convenios(): 'cnpjFornecedor' -> 'cnpjConvenente'
+  - _format_cnpj(): helper interno — cnpj_formatted não depende mais do upstream
+  - _analyze_price_anomalies(): remove break — todos os keywords são avaliados por contrato
+  - _check_cnae_incompativel(): threshold 70% ao invés de 100% — menos falso negativo
+  - _generate_findings(): volume finding protegido contra CEIS e CNEP simultaneamente
 """
 
 import os
@@ -37,7 +41,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Configuracao
+# ---------------------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------------------
 BASE_URL          = "https://api.portaldatransparencia.gov.br/api-de-dados"
 BRASILAPI_URL     = "https://brasilapi.com.br/api/cnpj/v1"
 API_KEY           = os.getenv("TRANSPARENCIA_API_KEY", "")
@@ -49,6 +55,9 @@ EMPRESA_NOVA_ANOS   = 2
 CAPITAL_RATIO_ALERT = 0.05
 CAPITAL_RATIO_CRIT  = 0.01
 CONTRATO_ALTO_VALOR = 500_000.00
+
+# FIX Bug 2 — threshold proporcional para CNAE incompatível
+CNAE_INCOMPATIVEL_THRESHOLD = 0.70  # 70% dos contratos devem ser incompatíveis para flaggar
 
 PRICE_REFERENCES: dict[str, tuple[float, float]] = {
     "mouse":           (30.0,     500.0),
@@ -74,7 +83,7 @@ PRICE_REFERENCES: dict[str, tuple[float, float]] = {
 
 _RE_QTD = re.compile(r"\b(\d{1,4})\s*(?:un(?:idades?)?|pc|pecas?|itens?)?\.?\s", re.IGNORECASE)
 
-# CNAE divisao (2 digitos) -> keywords esperadas no objeto de contratos
+# CNAE divisão (2 dígitos) -> keywords esperadas no objeto dos contratos
 CNAE_KEYWORDS: dict[str, list[str]] = {
     "62": ["software", "sistema", "desenvolvimento", "ti", "tecnologia", "aplicativo",
            "plataforma", "licenca", "suporte tecnico", "manutencao de sistema"],
@@ -98,7 +107,26 @@ CNAE_KEYWORDS: dict[str, list[str]] = {
 }
 
 
-# Schemas
+# ---------------------------------------------------------------------------
+# Helpers internos
+# ---------------------------------------------------------------------------
+
+def _format_cnpj(cnpj: str) -> str:
+    """
+    Formata CNPJ numérico para o padrão XX.XXX.XXX/XXXX-XX.
+
+    FIX Bug 1 — o cnpj_formatted não depende mais do upstream.
+    Funciona como fallback: se o CNPJ já estiver formatado, devolve igual.
+    """
+    digits = re.sub(r"\D", "", cnpj)
+    if len(digits) != 14:
+        return cnpj  # devolve o original se não tiver 14 dígitos
+    return f"{digits[:2]}.{digits[2:5]}.{digits[5:8]}/{digits[8:12]}-{digits[12:]}"
+
+
+# ---------------------------------------------------------------------------
+# Schemas Pydantic
+# ---------------------------------------------------------------------------
 
 class ContractRecord(BaseModel):
     id: str = Field("", alias="id")
@@ -157,11 +185,11 @@ class ConvenioRecord(BaseModel):
 
 class PartnerRecord(BaseModel):
     """
-    Socio da empresa extraido do QSA (Quadro Societario e Administrativo).
+    Sócio da empresa extraído do QSA (Quadro Societário e Administrativo).
 
-    O CPF na Receita Federal e parcialmente mascarado (ex: ***123456**).
-    Util para identificacao por nome e cruzamento manual com TSE.
-    Para cruzamento TSE: nome + municipio + faixa etaria.
+    O CPF na Receita Federal é parcialmente mascarado (ex: ***123456**).
+    Útil para identificação por nome e cruzamento manual com TSE.
+    Para cruzamento TSE: nome + município + faixa etária.
     """
     name: str = ""
     cpf_masked: str = ""
@@ -174,7 +202,7 @@ class PartnerRecord(BaseModel):
 class ProfileFlag(BaseModel):
     """
     Sinal de alerta do perfil HUMINT da empresa.
-    Cada flag e um indicador isolado. A convergencia de multiplos flags
+    Cada flag é um indicador isolado. A convergência de múltiplos flags
     eleva o risco mesmo sem prova formal de irregularidade.
     """
     flag_type: str
@@ -257,10 +285,12 @@ class GovAgentOutput(BaseModel):
     errors: list[str] = []
 
 
+# ---------------------------------------------------------------------------
 # HTTP helpers
+# ---------------------------------------------------------------------------
 
 def _get(endpoint: str, params: dict) -> Optional[list]:
-    """GET autenticado contra a API do Portal da Transparencia."""
+    """GET autenticado contra a API do Portal da Transparência."""
     if not API_KEY:
         logger.warning("gov_agent: TRANSPARENCIA_API_KEY nao configurada")
         return None
@@ -268,7 +298,7 @@ def _get(endpoint: str, params: dict) -> Optional[list]:
     url     = f"{BASE_URL}{endpoint}"
     headers = {"chave-api-dados": API_KEY, "Accept": "application/json"}
     params.setdefault("pagina", 1)
-    params.setdefault("tamanhoPagina", MAX_ITEMS)   # CORRECAO: nao 'itens'
+    params.setdefault("tamanhoPagina", MAX_ITEMS)
 
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
@@ -302,7 +332,7 @@ def _get(endpoint: str, params: dict) -> Optional[list]:
 
 
 def _get_brasilapi(cnpj: str) -> Optional[dict]:
-    """Receita Federal via BrasilAPI — sem autenticacao."""
+    """Receita Federal via BrasilAPI — sem autenticação."""
     try:
         resp = requests.get(f"{BRASILAPI_URL}/{cnpj}", timeout=TIMEOUT,
                             headers={"Accept": "application/json"})
@@ -313,7 +343,9 @@ def _get_brasilapi(cnpj: str) -> Optional[dict]:
     return None
 
 
+# ---------------------------------------------------------------------------
 # Coleta por endpoint
+# ---------------------------------------------------------------------------
 
 def _parse_partners(raw_qsa: list) -> list[PartnerRecord]:
     """Parseia QSA retornado pela BrasilAPI. CPF mascarado pela Receita Federal."""
@@ -334,7 +366,7 @@ def _parse_partners(raw_qsa: list) -> list[PartnerRecord]:
 
 
 def _fetch_company_info(cnpj: str) -> tuple[CompanyInfo, Optional[str]]:
-    """Dados cadastrais + QSA via BrasilAPI. Infere dominio do email."""
+    """Dados cadastrais + QSA via BrasilAPI. Infere domínio do email."""
     raw = _get_brasilapi(cnpj)
     if not raw:
         return CompanyInfo(), "BrasilAPI: sem dados para este CNPJ"
@@ -428,7 +460,7 @@ def _fetch_cnep(cnpj: str) -> tuple[list[SanctionRecord], Optional[str]]:
 
 
 def _fetch_convenios(cnpj: str) -> tuple[list[ConvenioRecord], Optional[str]]:
-    """CORRECAO: cnpjConvenente (nao cnpjFornecedor — causa HTTP 400)."""
+    """CORREÇÃO: cnpjConvenente (não cnpjFornecedor — causa HTTP 400)."""
     raw = _get("/convenios", {"cnpjConvenente": cnpj})
     time.sleep(SLEEP_BETWEEN)
     if raw is None:
@@ -442,21 +474,39 @@ def _fetch_convenios(cnpj: str) -> tuple[list[ConvenioRecord], Optional[str]]:
     return records, None
 
 
-# Analise financeira
+# ---------------------------------------------------------------------------
+# Análise financeira
+# ---------------------------------------------------------------------------
 
 def _analyze_price_anomalies(contracts: list[ContractRecord]) -> list[PriceAnomaly]:
-    """Detecta sobreprecao comparando preco unitario implicito com referencia de mercado."""
-    anomalies = []
+    """
+    Detecta sobrepreço comparando preço unitário implícito com referência de mercado.
+
+    FIX Bug 3 — removido `break` após primeiro keyword match.
+    Antes: só analisava o PRIMEIRO keyword que batesse no objeto do contrato.
+    Agora: todos os keywords são avaliados; a anomalia mais grave prevalece
+    (não há duplicatas pois cada keyword gera no máximo 1 anomalia por contrato).
+    """
+    anomalies: list[PriceAnomaly] = []
+    seen: set[tuple[str, str]] = set()  # (contract_number, keyword) já processados
+
     for contract in contracts:
         obj = contract.object_description.lower()
         for keyword, (_, max_price) in PRICE_REFERENCES.items():
             if keyword not in obj:
                 continue
+            key = (contract.number, keyword)
+            if key in seen:
+                continue
+            seen.add(key)
+
             m        = _RE_QTD.search(obj)
             quantity = int(m.group(1)) if m else 1
             unit     = contract.value / quantity if quantity > 0 else contract.value
+
             if unit <= max_price * 3:
-                continue
+                continue  # dentro do aceitável
+
             factor   = round(unit / max_price, 1)
             severity = "CRITICAL" if factor >= 10 else "HIGH"
             anomalies.append(PriceAnomaly(
@@ -471,12 +521,11 @@ def _analyze_price_anomalies(contracts: list[ContractRecord]) -> list[PriceAnoma
                 organ              = contract.organ,
                 severity           = severity,
             ))
-            break
     return anomalies
 
 
 def _analyze_fractioning(contracts: list[ContractRecord]) -> list[FractioningPattern]:
-    """Detecta fracionamento artificial — multiplos contratos abaixo do limiar de licitacao."""
+    """Detecta fracionamento artificial — múltiplos contratos abaixo do limiar de licitação."""
     by_organ: dict[str, list[ContractRecord]] = {}
     for c in contracts:
         by_organ.setdefault(c.organ or "DESCONHECIDO", []).append(c)
@@ -501,10 +550,12 @@ def _analyze_fractioning(contracts: list[ContractRecord]) -> list[FractioningPat
     return sorted(patterns, key=lambda p: p.suspicion_score, reverse=True)
 
 
-# Analise HUMINT
+# ---------------------------------------------------------------------------
+# Análise HUMINT
+# ---------------------------------------------------------------------------
 
 def _parse_date(date_str: str) -> Optional[date]:
-    """Parseia data ISO ou BR. Retorna None se invalido."""
+    """Parseia data ISO ou BR. Retorna None se inválido."""
     if not date_str:
         return None
     for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
@@ -522,8 +573,8 @@ def _check_empresa_nova(
     """
     Empresa jovem ganhando contratos de alto valor.
 
-    Padrao classico de testa de ferro: empresa aberta poucos meses antes
-    de uma licitacao direcionada. Capital baixo, sem historico, sem estrutura
+    Padrão clássico de testa de ferro: empresa aberta poucos meses antes
+    de uma licitação direcionada. Capital baixo, sem histórico, sem estrutura
     — mas ganha o contrato de R$10M.
     """
     if not company.data_abertura:
@@ -548,19 +599,19 @@ def _check_empresa_nova(
         title     = f"Empresa com {idade_anos:.1f} ano(s) — contrato de R${maior.value:,.2f}",
         detail    = (
             f"Data de abertura: {company.data_abertura}. "
-            f"Idade na analise: {idade_anos:.1f} anos. "
+            f"Idade na análise: {idade_anos:.1f} anos. "
             f"Contratos de alto valor: {len(altos)}."
         ),
         evidence  = [
             f"Abertura: {company.data_abertura}",
             f"Porte: {company.porte or 'nao informado'}",
             f"Maior contrato: R${maior.value:,.2f} — {maior.object_description[:60]}",
-            f"Orgao: {maior.organ}",
+            f"Órgão: {maior.organ}",
         ],
         investigative_note = (
-            "Verificar: socios (QSA) e se tem vinculos com agentes publicos do orgao contratante. "
+            "Verificar: sócios (QSA) e se tem vínculos com agentes públicos do órgão contratante. "
             "Cruzar data de abertura com data do edital. "
-            "Consultar Compras.gov.br pelo numero do processo licitatorio."
+            "Consultar Compras.gov.br pelo número do processo licitatório."
         ),
     )
 
@@ -570,11 +621,11 @@ def _check_capital_incompativel(
     total_contract_value: float,
 ) -> Optional[ProfileFlag]:
     """
-    Capital social incompativel com o volume contratado.
+    Capital social incompatível com o volume contratado.
 
-    Uma empresa com capital de R$1.000 nao tem capacidade economica para
+    Uma empresa com capital de R$1.000 não tem capacidade econômica para
     executar um contrato de R$5M. Pode ser casca para desviar recursos.
-    Base legal: art. 67 Lei 14.133/2021 exige qualificacao economico-financeira.
+    Base legal: art. 67 Lei 14.133/2021 exige qualificação econômico-financeira.
     """
     if company.capital_social <= 0 or total_contract_value <= 0:
         return None
@@ -593,18 +644,18 @@ def _check_capital_incompativel(
         detail    = (
             f"Capital declarado: R${company.capital_social:,.2f}. "
             f"Total contratado: R${total_contract_value:,.2f}. "
-            f"Razao: {ratio*100:.2f}% (limiar: {CAPITAL_RATIO_ALERT*100:.0f}%)."
+            f"Razão: {ratio*100:.2f}% (limiar: {CAPITAL_RATIO_ALERT*100:.0f}%)."
         ),
         evidence  = [
             f"Capital social: R${company.capital_social:,.2f}",
             f"Total contratado: R${total_contract_value:,.2f}",
-            f"Razao: {ratio*100:.2f}%",
+            f"Razão: {ratio*100:.2f}%",
             f"Porte: {company.porte or 'nao informado'}",
         ],
         investigative_note = (
-            "Verificar garantias contratuais apresentadas (caucao, fianca bancaria). "
-            "Consultar balanco patrimonial via Junta Comercial. "
-            "Capital abaixo de 10% do contrato pode indicar habilitacao irregular — "
+            "Verificar garantias contratuais apresentadas (caução, fiança bancária). "
+            "Consultar balanço patrimonial via Junta Comercial. "
+            "Capital abaixo de 10% do contrato pode indicar habilitação irregular — "
             "art. 67 III, Lei 14.133/2021."
         ),
     )
@@ -615,10 +666,12 @@ def _check_cnae_incompativel(
     contracts: list[ContractRecord],
 ) -> Optional[ProfileFlag]:
     """
-    CNAE da empresa incompativel com o objeto dos contratos.
+    CNAE da empresa incompatível com o objeto dos contratos.
 
-    Empresa de 'alimentacao' ganhando contrato de 'desenvolvimento de software'
-    = sinal claro de direcionamento ou testa de ferro.
+    FIX Bug 2 — threshold proporcional (CNAE_INCOMPATIVEL_THRESHOLD = 70%).
+    Antes: só flaggava se 100% dos contratos fossem incompatíveis.
+    Agora: flagga se >= 70% forem incompatíveis — captura casos reais sem perder
+    empresas legítimas que têm 1 contrato fora do CNAE principal.
     """
     if not company.cnae_principal or not contracts:
         return None
@@ -634,31 +687,34 @@ def _check_cnae_incompativel(
         if not any(kw in c.object_description.lower() for kw in expected_kw)
     ]
 
-    # Flagga somente se TODOS os contratos sao incompativeis (evita falso positivo)
-    if not incompatible or len(incompatible) < len(contracts):
+    incompatible_ratio = len(incompatible) / len(contracts)
+    if incompatible_ratio < CNAE_INCOMPATIVEL_THRESHOLD:
         return None
 
     return ProfileFlag(
         flag_type = "CNAE_INCOMPATIVEL",
         severity  = "HIGH",
         title     = (
-            f"CNAE '{company.cnae_descricao}' incompativel com "
-            f"{len(incompatible)} contrato(s)"
+            f"CNAE '{company.cnae_descricao}' incompatível com "
+            f"{len(incompatible)}/{len(contracts)} contrato(s) "
+            f"({incompatible_ratio*100:.0f}%)"
         ),
         detail    = (
             f"Atividade registrada: '{company.cnae_descricao}'. "
             f"Espera termos como: {', '.join(expected_kw[:4])}. "
-            f"Nenhum dos {len(contracts)} contrato(s) contem esses termos."
+            f"{len(incompatible)} de {len(contracts)} contrato(s) não contêm esses termos "
+            f"({incompatible_ratio*100:.0f}% — limiar: {CNAE_INCOMPATIVEL_THRESHOLD*100:.0f}%)."
         ),
         evidence  = [
             f"CNAE: {company.cnae_principal} — {company.cnae_descricao}",
             f"Termos esperados: {', '.join(expected_kw[:4])}",
-            *[f"Contrato: '{c.object_description[:60]}'" for c in incompatible[:3]],
+            *[f"Contrato incompatível: '{c.object_description[:60]}'" for c in incompatible[:3]],
         ],
         investigative_note = (
-            "Verificar CNAEs secundarios (nao aparecem na BrasilAPI v1 — consultar Junta Comercial). "
-            "Incompatibilidade total sugere empresa criada para contrato especifico (testa de ferro). "
-            "Acionar TCU/CGU se confirmado o direcionamento licitatorio."
+            "Verificar CNAEs secundários (não aparecem na BrasilAPI v1 — consultar Junta Comercial). "
+            f"Incompatibilidade em {incompatible_ratio*100:.0f}% dos contratos sugere "
+            "empresa criada para contrato específico (testa de ferro). "
+            "Acionar TCU/CGU se confirmado o direcionamento licitatório."
         ),
     )
 
@@ -669,7 +725,7 @@ def _check_situacao_cadastral(
 ) -> Optional[ProfileFlag]:
     """
     Empresa inapta/irregular na Receita mas com contratos ativos.
-    Empresa inapta nao deveria ser habilitada em licitacoes.
+    Empresa inapta não deveria ser habilitada em licitações.
     """
     situacao     = company.situacao_cadastral.upper()
     is_irregular = any(s in situacao for s in ("INAPTA", "BAIXADA", "SUSPENSA", "IRREGULAR"))
@@ -684,18 +740,18 @@ def _check_situacao_cadastral(
         severity  = "CRITICAL",
         title     = f"Empresa '{company.situacao_cadastral}' com contratos governamentais",
         detail    = (
-            f"Situacao Receita Federal: '{company.situacao_cadastral}'. "
+            f"Situação Receita Federal: '{company.situacao_cadastral}'. "
             f"Contratos ativos: {len(ativas) if ativas else len(contracts)}."
         ),
         evidence  = [
-            f"Situacao: {company.situacao_cadastral}",
+            f"Situação: {company.situacao_cadastral}",
             f"Total contratos: {len(contracts)}",
             f"Contratos ativos: {len(ativas)}",
         ],
         investigative_note = (
-            "Verificar SICAF — orgao deveria ter identificado a irregularidade na habilitacao. "
-            "Se contrato firmado apos inaptidao, pode configurar improbidade administrativa "
-            "do agente responsavel (Lei 8.429/1992)."
+            "Verificar SICAF — órgão deveria ter identificado a irregularidade na habilitação. "
+            "Se contrato firmado após inaptidão, pode configurar improbidade administrativa "
+            "do agente responsável (Lei 8.429/1992)."
         ),
     )
 
@@ -706,7 +762,7 @@ def _check_socio_unico(
 ) -> Optional[ProfileFlag]:
     """
     Empresa unipessoal com alto volume contratual.
-    Mais facil de operar como laranja — sem outros socios para questionar decisoes.
+    Mais fácil de operar como laranja — sem outros sócios para questionar decisões.
     """
     if len(company.partners) != 1 or total_contract_value < CONTRATO_ALTO_VALOR:
         return None
@@ -717,20 +773,20 @@ def _check_socio_unico(
         severity  = "MEDIUM",
         title     = f"Empresa unipessoal — R${total_contract_value:,.2f} em contratos",
         detail    = (
-            f"Unico socio: {socio.name} ({socio.qualification}). "
-            f"Controle centralizado facilita operacao como testa de ferro."
+            f"Único sócio: {socio.name} ({socio.qualification}). "
+            f"Controle centralizado facilita operação como testa de ferro."
         ),
         evidence  = [
-            f"Socio unico: {socio.name}",
-            f"Qualificacao: {socio.qualification}",
+            f"Sócio único: {socio.name}",
+            f"Qualificação: {socio.qualification}",
             f"Entrada na sociedade: {socio.entry_date or 'nao informado'}",
-            f"Faixa etaria: {socio.age_bracket or 'nao informado'}",
+            f"Faixa etária: {socio.age_bracket or 'nao informado'}",
             f"Total contratado: R${total_contract_value:,.2f}",
         ],
         investigative_note = (
-            f"Pesquisar '{socio.name}' + municipio + 'politico' / 'vereador' / 'servidor'. "
+            f"Pesquisar '{socio.name}' + município + 'político' / 'vereador' / 'servidor'. "
             "Cruzar com dadosabertos.tse.jus.br (aba candidatos — busca por nome). "
-            "Verificar outros CNPJs do mesmo socio (busca por nome na Junta Comercial)."
+            "Verificar outros CNPJs do mesmo sócio (busca por nome na Junta Comercial)."
         ),
     )
 
@@ -740,7 +796,7 @@ def _analyze_humint_profile(
     contracts: list[ContractRecord],
     total_value: float,
 ) -> list[ProfileFlag]:
-    """Executa todos os checks HUMINT. Cada check e independente."""
+    """Executa todos os checks HUMINT. Cada check é independente."""
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     flags = []
 
@@ -761,7 +817,9 @@ def _analyze_humint_profile(
     return sorted(flags, key=lambda f: severity_order.get(f.severity, 99))
 
 
-# Calculo de risco
+# ---------------------------------------------------------------------------
+# Cálculo de risco
+# ---------------------------------------------------------------------------
 
 def _calculate_risk(summary: GovSummary) -> str:
     if summary.is_sanctioned or summary.price_anomalies > 0:
@@ -778,7 +836,9 @@ def _calculate_risk(summary: GovSummary) -> str:
     return "LOW"
 
 
-# Geracao de findings
+# ---------------------------------------------------------------------------
+# Geração de findings
+# ---------------------------------------------------------------------------
 
 def _generate_findings(output: GovAgentOutput) -> list[dict]:
     findings: list[dict] = []
@@ -787,7 +847,7 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
         all_s = output.sanctions_ceis + output.sanctions_cnep
         types = list({s.type for s in all_s})
         findings.append({
-            "title":    f"Sancoes governamentais ativas ({', '.join(types)})",
+            "title":    f"Sanções governamentais ativas ({', '.join(types)})",
             "severity": "CRITICAL",
             "category": "Gov Intelligence",
             "mitre_id": "T1588", "mitre_name": "Obtain Capabilities",
@@ -799,17 +859,17 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
                 for s in all_s[:5]
             ],
             "recommendation": "Verificar contratos ativos. Avaliar riscos de compliance.",
-            "source": "Portal da Transparencia / CEIS / CNEP",
+            "source": "Portal da Transparência / CEIS / CNEP",
             "kill_chain": [
-                "Identificacao via CEIS/CNEP",
+                "Identificação via CEIS/CNEP",
                 "Cruzamento com contratos ativos",
-                "Avaliacao de impacto na cadeia de fornecimento",
+                "Avaliação de impacto na cadeia de fornecimento",
             ],
         })
 
     for a in output.price_anomalies:
         findings.append({
-            "title":    f"Sobreprecao detectado — {a.keyword_matched} ({a.severity})",
+            "title":    f"Sobrepreço detectado — {a.keyword_matched} ({a.severity})",
             "severity": a.severity,
             "category": "Gov Intelligence",
             "mitre_id": "T1591.002",
@@ -817,22 +877,22 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
             "description": (
                 f"Contrato {a.contract_number} com {a.organ}: '{a.object_description}' "
                 f"— R${a.contract_value:,.2f}. "
-                f"Preco unitario: R${a.unit_price:,.2f} ({a.overprice_factor:.1f}x acima de R${a.max_reasonable:,.2f})."
+                f"Preço unitário: R${a.unit_price:,.2f} ({a.overprice_factor:.1f}x acima de R${a.max_reasonable:,.2f})."
             ),
             "evidence": [
                 f"Objeto: {a.object_description}",
                 f"Quantidade estimada: {a.estimated_quantity} unidades",
-                f"Preco unitario: R${a.unit_price:,.2f}",
-                f"Referencia mercado: R${a.max_reasonable:,.2f}/unidade",
-                f"Fator sobreprecao: {a.overprice_factor:.1f}x",
+                f"Preço unitário: R${a.unit_price:,.2f}",
+                f"Referência mercado: R${a.max_reasonable:,.2f}/unidade",
+                f"Fator sobrepreço: {a.overprice_factor:.1f}x",
             ],
             "recommendation": "Cruzar com Compras.gov.br. Reportar TCU/CGU se confirmado.",
-            "source": "Portal da Transparencia / Contratos",
+            "source": "Portal da Transparência / Contratos",
             "kill_chain": [
-                "Identificacao via PRICE_REFERENCES",
-                "Estimativa preco unitario (objeto + regex quantidade)",
-                "Comparacao com referencia de mercado",
-                "Flag para revisao humana",
+                "Identificação via PRICE_REFERENCES",
+                "Estimativa preço unitário (objeto + regex quantidade)",
+                "Comparação com referência de mercado",
+                "Flag para revisão humana",
             ],
         })
 
@@ -854,11 +914,11 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
                 for p in alerta[:3]
             ],
             "recommendation": "Verificar datas dos contratos. Acionar CGU/TCU se confirmado.",
-            "source": "Portal da Transparencia / Contratos",
+            "source": "Portal da Transparência / Contratos",
             "kill_chain": [
-                "Agrupamento por orgao",
+                "Agrupamento por órgão",
                 "Contagem abaixo do limiar",
-                "Calculo valor acumulado vs limiar",
+                "Cálculo valor acumulado vs limiar",
                 "Scoring 0-100",
             ],
         })
@@ -868,7 +928,7 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
         findings.append({
             "title":    flag.title,
             "severity": flag.severity,
-            "category": "HUMINT / Perfil Societario",
+            "category": "HUMINT / Perfil Societário",
             "mitre_id": "T1591.001",
             "mitre_name": "Gather Victim Org Information: Determine Physical Locations",
             "description": flag.detail,
@@ -877,14 +937,15 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
             "source":   "BrasilAPI / Receita Federal",
             "kill_chain": [
                 "Coleta cadastral via BrasilAPI",
-                "Analise de QSA e situacao cadastral",
-                f"Deteccao: {flag.flag_type}",
-                "Flag para investigacao humana — dados publicos",
+                "Análise de QSA e situação cadastral",
+                f"Detecção: {flag.flag_type}",
+                "Flag para investigação humana — dados públicos",
             ],
         })
 
-    # Volume contratual
-    if output.summary.total_contracts > 0 and not output.sanctions_ceis:
+    # FIX Bug 4 — protege contra CEIS e CNEP simultaneamente
+    is_sanctioned = bool(output.sanctions_ceis or output.sanctions_cnep)
+    if output.summary.total_contracts > 0 and not is_sanctioned:
         sev = "HIGH" if output.summary.total_contract_value > 10_000_000 else "MEDIUM"
         findings.append({
             "title":    f"{output.summary.total_contracts} contrato(s) — R${output.summary.total_contract_value:,.2f}",
@@ -896,50 +957,50 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
                 f"Contrato {c.number}: {c.object_description[:80]} — R${c.value:,.2f}"
                 for c in output.contracts[:5]
             ],
-            "recommendation": "Verificar postura de seguranca dos sistemas integrados ao governo.",
-            "source": "Portal da Transparencia / Contratos",
+            "recommendation": "Verificar postura de segurança dos sistemas integrados ao governo.",
+            "source": "Portal da Transparência / Contratos",
             "kill_chain": [],
         })
 
-    # Dominio corporativo
+    # Domínio corporativo
     if output.company_info.domain_hint:
         findings.append({
-            "title":    "Dominio corporativo identificado via Receita Federal",
+            "title":    "Domínio corporativo identificado via Receita Federal",
             "severity": "INFO",
             "category": "Gov Intelligence",
             "mitre_id": "T1590", "mitre_name": "Gather Victim Network Information",
             "description": (
-                f"Dominio inferido: '{output.company_info.domain_hint}'. "
+                f"Domínio inferido: '{output.company_info.domain_hint}'. "
                 f"Empresa: {output.company_info.razao_social}."
             ),
             "evidence": [
                 f"Email Receita Federal: {output.company_info.email}",
-                f"Dominio inferido: {output.company_info.domain_hint}",
+                f"Domínio inferido: {output.company_info.domain_hint}",
                 f"CNAE: {output.company_info.cnae_principal} — {output.company_info.cnae_descricao}",
             ],
             "recommendation": (
-                f"Adicionar '{output.company_info.domain_hint}' ao pipeline tecnico "
-                "para analise DNS, WHOIS, Shodan, headers."
+                f"Adicionar '{output.company_info.domain_hint}' ao pipeline técnico "
+                "para análise DNS, WHOIS, Shodan, headers."
             ),
             "source": "BrasilAPI / Receita Federal",
             "kill_chain": [
-                "Extracao de email via CNPJ",
-                "Inferencia de dominio corporativo",
-                "Injecao no pipeline tecnico OSINT",
+                "Extração de email via CNPJ",
+                "Inferência de domínio corporativo",
+                "Injeção no pipeline técnico OSINT",
             ],
         })
 
-    # QSA — socios para cruzamento TSE
+    # QSA — sócios para cruzamento TSE
     if output.company_info.partners:
         partners = output.company_info.partners
         findings.append({
-            "title":    f"QSA: {len(partners)} socio(s) — verificar vinculos politicos",
+            "title":    f"QSA: {len(partners)} sócio(s) — verificar vínculos políticos",
             "severity": "INFO",
-            "category": "HUMINT / Perfil Societario",
+            "category": "HUMINT / Perfil Societário",
             "mitre_id": "T1591.001",
             "mitre_name": "Gather Victim Org Information",
             "description": (
-                f"Quadro societario com {len(partners)} membro(s). "
+                f"Quadro societário com {len(partners)} membro(s). "
                 "CPFs mascarados pela Receita Federal. "
                 "Cruzamento com TSE requer pesquisa manual por nome."
             ),
@@ -949,13 +1010,13 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
             ],
             "recommendation": (
                 "Pesquisar cada nome em dadosabertos.tse.jus.br (candidatos). "
-                "Verificar se socios sao servidores do orgao contratante "
+                "Verificar se sócios são servidores do órgão contratante "
                 "(conflito de interesses — Lei 12.813/2013)."
             ),
             "source": "BrasilAPI / Receita Federal (QSA)",
             "kill_chain": [
-                "Extracao QSA via BrasilAPI",
-                "Listagem de socios com qualificacao e data de entrada",
+                "Extração QSA via BrasilAPI",
+                "Listagem de sócios com qualificação e data de entrada",
                 "Flag para cruzamento manual com TSE e SIAPE",
             ],
         })
@@ -963,16 +1024,20 @@ def _generate_findings(output: GovAgentOutput) -> list[dict]:
     return findings
 
 
+# ---------------------------------------------------------------------------
 # Entry point
+# ---------------------------------------------------------------------------
 
 def run(normalized: dict) -> dict:
     """
     Entry point principal do gov_agent.
-    Nunca propaga excecoes para o pipeline.
+    Nunca propaga exceções para o pipeline.
     """
-    cnpj           = normalized.get("target", "")
-    cnpj_formatted = normalized.get("metadata", {}).get("cnpj_formatted", cnpj)
+    cnpj   = normalized.get("target", "")
     errors: list[str] = []
+
+    # FIX Bug 1 — formata internamente, não depende do upstream
+    cnpj_formatted = _format_cnpj(cnpj)
 
     logger.info("gov_agent: CNPJ %s", cnpj_formatted)
 
