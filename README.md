@@ -53,6 +53,16 @@ Cada finding vem com MITRE ATT&CK mapeado, cenário de exploração realista e r
 
 ---
 
+## Exemplo de Relatório Gerado
+
+O `intel_reporter.py` transforma o JSON do pipeline em um relatório de 9 seções no padrão pentest — 100% determinístico, sem dependência de IA na geração.
+
+![Relatório gerado — F-001](assets/screenshots/Report.png)
+
+Cada finding inclui: severidade com prazo de remediação, link direto para a técnica MITRE ATT&CK, descrição técnica, evidência coletada, cenário de exploração passo a passo com comandos reais, e verificação de remediação executável.
+
+---
+
 ## Pipeline
 
 ```
@@ -253,8 +263,8 @@ Nenhum agente acessa sistemas, autentica em serviços ou executa código em alvo
 
 ## Autor
 
-**Pablo Henrick**  
-Security Developer em Formação | Construindo o Sentinel OSINT 
+**Pablo Henrick**
+Security Developer em Formação | Construindo o Sentinel OSINT
 [LinkedIn](https://www.linkedin.com/in/pablohenrick/) · [GitHub](https://github.com/PabloHenrickk)
 
 ---
