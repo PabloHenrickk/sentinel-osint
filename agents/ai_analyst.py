@@ -1090,6 +1090,59 @@ def _convert_subdomain_findings(subdomain_data: dict) -> list[dict]:
     logger.info(f"[ai_analyst] Takeover findings pre-convertidos: {len(converted)}")
     return converted
 
+def _build_gov_block(gov_data: list[dict]) -> list[str]:
+    """Serializa dados do gov_agent para o contexto do LLM."""
+    lines = ["", "## GOV INTELLIGENCE (Portal da Transparência)"]
+    for g in gov_data:
+        if g.get("error"):
+            continue
+        summary = g.get("summary", {})
+        risk    = summary.get("risk_level", "UNKNOWN")
+        lines += [
+            "",
+            f"CNPJ: {g.get('cnpj_formatted', '—')}",
+            f"Risco governamental: {risk}",
+            f"Sanções CEIS/CNEP: {summary.get('sanction_count', 0)}",
+            f"Contratos públicos: {summary.get('total_contracts', 0)} "
+            f"(R$ {summary.get('total_contract_value', 0):,.2f})",
+            f"Convênios federais: {summary.get('total_convenios', 0)}",
+        ]
+        sanctions = g.get("sanctions_ceis", []) + g.get("sanctions_cnep", [])
+        if sanctions:
+            lines.append("Sanções detalhadas:")
+            for s in sanctions[:5]:
+                tipo = s.get("type", "?")
+                desc = s.get("sanction_type", s.get("tipoSancao", "?"))
+                org  = s.get("sanctioning_organ", s.get("orgaoSancionador", "?"))
+                lines.append(f"  - [{tipo}] {desc} — {org}")
+
+        findings = g.get("gov_intel_findings", [])
+        if findings:
+            lines.append(f"Findings gov detectados: {len(findings)}")
+            for f in findings[:3]:
+                lines.append(
+                    f"  [{f.get('severity','?')}] {f.get('title','?')} | {f.get('mitre_id','')}"
+                )
+    return lines
+
+
+def _convert_gov_findings(gov_data: list[dict]) -> list[dict]:
+    """
+    Extrai gov_intel_findings do gov_agent e os prepara para o merge
+    determinístico. Os findings já chegam no schema de Finding — só
+    marcamos a fonte para rastreabilidade.
+    """
+    converted: list[dict] = []
+    for g in gov_data:
+        if g.get("error"):
+            continue
+        for f in g.get("gov_intel_findings", []):
+            finding = dict(f)                 # cópia defensiva
+            finding["_source"] = "gov_agent"  # rastreabilidade no JSON final
+            converted.append(finding)
+    logger.info(f"[ai_analyst] Gov findings convertidos: {len(converted)}")
+    return converted
+
 
 def _merge_findings(llm_findings: list[dict], confirmed_findings: list[dict]) -> list[dict]:
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
@@ -1122,6 +1175,7 @@ def run(
     subdomain_data  : Optional[dict] = None,
     header_data     : Optional[dict] = None,
     txt_intel       : Optional[dict] = None,
+    gov_data        : Optional[list] = None, 
 ) -> dict:
     is_ip  = collected_data.get("is_ip", False)
     target = collected_data.get("ip") if is_ip else collected_data.get("domain", "desconhecido")
@@ -1165,6 +1219,9 @@ def run(
             "", "## CORRELAÇÃO ENTRE ALVOS",
             json.dumps(correlator_data, indent=2, ensure_ascii=False),
         ]
+
+    if gov_data:                                                   
+        context_parts += _build_gov_block(gov_data) 
 
     if enrichment_data and "error" not in enrichment_data:
         context_parts += _build_enrichment_block(enrichment_data, provider=provider)
@@ -1238,6 +1295,7 @@ def run(
     confirmed_findings = (
         _convert_header_findings(header_data)
         + _convert_subdomain_findings(subdomain_data)
+        + _convert_gov_findings(gov_data or [])    
     )
     if confirmed_findings:
         llm_findings         = analysis.get("findings", [])

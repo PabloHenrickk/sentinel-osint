@@ -329,6 +329,7 @@ def process_single_target(
     correlator_snapshot: dict | None,
     enable_subdomains: bool = False,
     resolved: dict = None,
+    gov_data: list[dict] | None = None,          
 ) -> dict | None:
 
     # Banner com tipo detectado
@@ -465,6 +466,7 @@ def process_single_target(
         enrichment_data = enrich_data,
         subdomain_data  = subdomain_result or None,
         header_data     = header_result or None,
+        gov_data        = gov_data or None,
     )
 
     # ── extração compatível com schema v1 (string) e v2 (dict) ──
@@ -553,21 +555,29 @@ def process_single_target(
 
 
 def run_pipeline(targets: list[str], enable_subdomains: bool = False) -> list[dict]:
+
     state     = load_session(targets)
     completed = set(state.get("completed", []))
     aprovados = state.get("aprovados", [])
     total     = len(targets)
+    gov_results: list[dict] = []
 
     correlate = _load_agent("correlator")
 
-    for idx, raw_target in enumerate(targets, 1):
+    # ── Garante que CNPJs são processados antes dos domínios ─────────────
+    # gov_results precisa estar populado quando process_single_target rodar
+    targets_sorted = sorted(
+        targets,
+        key=lambda t: 0 if normalize(t).get("requires_gov_agent") else 1
+    )
+
+    for idx, raw_target in enumerate(targets_sorted, 1): 
 
         if raw_target in completed:
             status_info(f"[{idx}/{total}] {raw_target} — já processado, pulando")
             continue
 
-        # ── Resolve e roteia o input ──────────────────────────────────────
-        resolved = normalize(raw_target)
+        resolved   = normalize(raw_target)
         input_type = resolved["original_type"]
 
         # Tipos ainda não implementados — avisa e pula
@@ -606,6 +616,7 @@ def run_pipeline(targets: list[str], enable_subdomains: bool = False) -> list[di
             except Exception as e:
                 status_warn(f"Database index falhou (não crítico): {e}")
 
+            gov_results.append(gov_result)
             completed.add(raw_target)
             state["completed"] = list(completed)
             save_session(state, targets)
@@ -626,6 +637,7 @@ def run_pipeline(targets: list[str], enable_subdomains: bool = False) -> list[di
             correlator_snapshot = correlator_snapshot,
             enable_subdomains   = enable_subdomains,
             resolved            = resolved,
+            gov_data            = gov_results or None,
         )
 
         if resultado:
