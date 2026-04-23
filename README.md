@@ -164,25 +164,29 @@ Isso abre um vetor de análise que Maltego, SpiderFoot e Shodan não entregam: c
 
 ```
 sentinel-osint/
-├── agents/              # agentes do pipeline
-│   ├── collector.py
-│   ├── validator.py
-│   ├── infra_agent.py
-│   ├── enrichment_agent.py
-│   ├── subdomain_agent.py
-│   ├── header_agent.py
-│   ├── ai_analyst.py
-│   ├── gov_agent.py     # em implementação
-│   └── intel_reporter.py
-├── core/
-│   └── database.py      # índice SQLite
-├── providers/           # abstrações de provider LLM
-├── docs/                # documentação técnica
-├── reports/             # relatórios gerados
-├── tests/               # testes automatizados
-├── data/                # JSONs de análise + banco SQLite
-├── main.py              # orquestrador do pipeline
-└── .env.example
+├── agents/
+│   ├── collector.py          # WHOIS + DNS
+│   ├── validator.py          # score de confiança 0–100
+│   ├── reporter.py           # relatório base
+│   ├── correlator.py         # correlação entre múltiplos alvos
+│   ├── shodan_agent.py       # reconhecimento via Shodan
+│   ├── infra_agent.py        # portas, banners, CVEs
+│   ├── enrichment_agent.py   # VirusTotal, AbuseIPDB, IPInfo, SSL
+│   ├── subdomain_agent.py    # enumeração + takeover detection
+│   ├── header_agent.py       # headers HTTP, cookies, CORS
+│   ├── ai_analyst.py         # análise por LLM + MITRE ATT&CK
+│   ├── gov_agent.py          # Portal da Transparência (em implementação)
+│   └── intel_reporter.py     # relatório de 9 seções
+├── core/                     # índice SQLite + utilitários
+├── providers/                # abstrações de provider LLM
+├── data/                     # JSONs de análise + banco SQLite
+├── docs/                     # documentação técnica
+├── logs/                     # logs de execução
+├── reports/                  # relatórios gerados
+├── tests/                    # testes automatizados
+├── main.py                   # orquestrador do pipeline
+├── pytest.ini
+└── requirements.txt
 ```
 
 ---
@@ -192,7 +196,7 @@ sentinel-osint/
 ```bash
 git clone https://github.com/PabloHenrickk/sentinel-osint.git
 cd sentinel-osint
-pip install -r requisitos.txt
+pip install -r requirements.txt
 cp .env.example .env
 ```
 
