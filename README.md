@@ -149,7 +149,7 @@ db.get_summary()                           # totais gerais do projeto
 
 ## Diferencial: Gov Intelligence
 
-Nenhuma plataforma OSINT cruza reconhecimento técnico de infraestrutura com dados governamentais brasileiros abertos.
+Não encontrei nenhuma plataforma OSINT que cruzasse reconhecimento técnico de infraestrutura com dados governamentais brasileiros abertos — então decidi construir isso.
 
 O `gov_agent.py` (em implementação) consultará o **Portal da Transparência** para:
 - Contratos públicos associados a um CNPJ
@@ -253,10 +253,10 @@ Nenhum agente acessa sistemas, autentica em serviços ou executa código em alvo
 
 ## Autor
 
-**Pablo Henrick Silva Moraes**  
-Security Developer | OSINT Engineer  
+**Pablo Henrick**  
+Security Developer em Formação | Construindo o Sentinel OSINT 
 [LinkedIn](https://www.linkedin.com/in/pablohenrick/) · [GitHub](https://github.com/PabloHenrickk)
 
 ---
 
-*Sentinel OSINT — inteligência que outros não entregam, automação que outros não construíram.*
+*Sentinel OSINT.*
